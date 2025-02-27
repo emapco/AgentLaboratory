@@ -12,6 +12,7 @@ from openai.types.chat.chat_completion_message_param import ChatCompletionMessag
 
 TOKENS_IN = dict()
 TOKENS_OUT = dict()
+MODEL_CLIENTS = dict()
 
 
 def ollama_cost():
@@ -20,7 +21,7 @@ def ollama_cost():
     local_power_cost = 0.52  # $/kwh - weighted average (2-tier cost - Bay Area)
     ollama_power_per_hour_cost = system_power_usage * local_power_cost
     # tokens
-    ollama_tokens_per_second = 20
+    ollama_tokens_per_second = 28
     ollama_tokens_per_hour = 3600 * ollama_tokens_per_second
     # cost
     ollama_token_cost = ollama_power_per_hour_cost / ollama_tokens_per_hour
@@ -29,36 +30,43 @@ def ollama_cost():
 
 def curr_cost_est():
     ollama_token_cost = ollama_cost()
+    num_tokens = 1000000
     costmap_in = {
-        "gpt-4o": 2.50 / 1000000,
-        "gpt-4o-mini": 0.150 / 1000000,
-        "o1-preview": 15.00 / 1000000,
-        "o1-mini": 3.00 / 1000000,
-        "claude-3-5-sonnet": 3.00 / 1000000,
-        "deepseek-chat": 1.00 / 1000000,
-        "o1": 15.00 / 1000000,
+        "gpt-4o": 2.50 / num_tokens,
+        "gpt-4o-mini": 0.150 / num_tokens,
+        "o1-preview": 15.00 / num_tokens,
+        "o1-mini": 3.00 / num_tokens,
+        "claude-3-5-sonnet": 3.00 / num_tokens,
+        "deepseek-chat": 1.00 / num_tokens,
+        "o1": 15.00 / num_tokens,
         "ollama": ollama_token_cost,
+        "fireworks": 3.00 / num_tokens,
     }
     costmap_out = {
-        "gpt-4o": 10.00 / 1000000,
-        "gpt-4o-mini": 0.6 / 1000000,
-        "o1-preview": 60.00 / 1000000,
-        "o1-mini": 12.00 / 1000000,
-        "claude-3-5-sonnet": 12.00 / 1000000,
-        "deepseek-chat": 5.00 / 1000000,
-        "o1": 60.00 / 1000000,
+        "gpt-4o": 10.00 / num_tokens,
+        "gpt-4o-mini": 0.6 / num_tokens,
+        "o1-preview": 60.00 / num_tokens,
+        "o1-mini": 12.00 / num_tokens,
+        "claude-3-5-sonnet": 12.00 / num_tokens,
+        "deepseek-chat": 5.00 / num_tokens,
+        "o1": 60.00 / num_tokens,
         "ollama": ollama_token_cost,
+        "fireworks": 8.00 / num_tokens,
     }
     return sum([costmap_in[_] * TOKENS_IN[_] for _ in TOKENS_IN]) + sum(
         [costmap_out[_] * TOKENS_OUT[_] for _ in TOKENS_OUT]
     )
 
 
-def compute_tokens(model_str, prompt, system_prompt, answer, print_cost):
+def compute_tokens(
+    model_str: str, prompt: str, system_prompt: str, answer: str, print_cost: bool
+):
     try:
         anthropic_models, openai_reasoning_models, openai_gpt_models = model_names()
         if model_str.startswith("ollama:"):
             model_str = "ollama"
+        if model_str.startswith("fireworks:"):
+            model_str = "fireworks"
 
         if model_str in [
             *anthropic_models,
@@ -168,7 +176,8 @@ def query_model(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ]
-                client = OpenAI()
+                client: OpenAI = MODEL_CLIENTS.get(model_str, OpenAI())
+                MODEL_CLIENTS[model_str] = client
                 completion = client.chat.completions.create(
                     model=model_str,
                     messages=messages,
@@ -177,14 +186,19 @@ def query_model(
                 answer = completion.choices[0].message.content
             elif model_str in openai_reasoning_models:
                 messages = [{"role": "user", "content": system_prompt + prompt}]
-                client = OpenAI()
+                client: OpenAI = MODEL_CLIENTS.get(model_str, OpenAI())
+                MODEL_CLIENTS[model_str] = client
                 completion = client.chat.completions.create(
                     model="o1-mini-2024-09-12", messages=messages
                 )
                 answer = completion.choices[0].message.content
             elif model_str in anthropic_models:
-                client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-                message = client.messages.create(
+                anthropic_client: anthropic.Anthropic = MODEL_CLIENTS.get(
+                    model_str,
+                    anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]),
+                )
+                MODEL_CLIENTS[model_str] = anthropic_client
+                message = anthropic_client.messages.create(
                     model=model_str,
                     system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
@@ -192,22 +206,49 @@ def query_model(
                 )  # type: ignore
                 answer = json.loads(message.to_json())["content"][0]["text"]
             elif model_str == "deepseek-chat":
-                model_str = "deepseek-chat"
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ]
-                deepseek_client = OpenAI(
-                    api_key=os.getenv("DEEPSEEK_API_KEY"),
-                    base_url="https://api.deepseek.com/v1",
+                client: OpenAI = MODEL_CLIENTS.get(
+                    model_str,
+                    OpenAI(
+                        api_key=os.getenv("DEEPSEEK_API_KEY"),
+                        base_url="https://api.deepseek.com/v1",
+                    ),
                 )
-                completion = deepseek_client.chat.completions.create(
+                MODEL_CLIENTS[model_str] = client
+                completion = client.chat.completions.create(
                     model="deepseek-chat", messages=messages, temperature=temp
                 )
                 answer = completion.choices[0].message.content
+            elif model_str.startswith("fireworks:"):
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ]
+                client: OpenAI = MODEL_CLIENTS.get(
+                    model_str,
+                    OpenAI(
+                        api_key=os.environ["FIREWORKS_API_KEY"],
+                        base_url="https://api.fireworks.ai/inference/v1",
+                    ),
+                )
+                MODEL_CLIENTS[model_str] = client
+                completion = client.chat.completions.create(
+                    model=f"accounts/fireworks/models/{model_str[10:]}",
+                    messages=messages,
+                    temperature=temp,
+                )
+                answer = completion.choices[0].message.content
             elif model_str.startswith("ollama:"):
-                ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-                ollama_client = ollama.Client(ollama_host)
+                ollama_client: ollama.Client = MODEL_CLIENTS.get(
+                    model_str,
+                    ollama.Client(
+                        os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+                    ),
+                )
+                MODEL_CLIENTS[model_str] = ollama_client
                 response: ollama.ChatResponse = ollama_client.chat(
                     model=model_str[7:],
                     messages=[
@@ -227,9 +268,9 @@ def query_model(
                     f"Unknown model: {model_str} - possible models: {possible_models}"
                 )
 
+            answer = answer or ""
             compute_tokens(model_str, prompt, system_prompt, answer, print_cost)
-
-            return answer or ""
+            return answer
         except Exception as e:
             print("Inference Exception:", e)
             time.sleep(timeout)
