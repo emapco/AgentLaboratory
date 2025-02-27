@@ -13,8 +13,6 @@ from openai.types.chat.chat_completion_message_param import ChatCompletionMessag
 TOKENS_IN = dict()
 TOKENS_OUT = dict()
 
-encoding = tiktoken.get_encoding("cl100k_base")
-
 
 def ollama_cost():
     # power
@@ -58,15 +56,20 @@ def curr_cost_est():
 
 def compute_tokens(model_str, prompt, system_prompt, answer, print_cost):
     try:
-        if model_str in ["o1-preview", "o1-mini", "claude-3.5-sonnet", "o1"]:
-            encoding = tiktoken.encoding_for_model("gpt-4o")
-        elif model_str in ["deepseek-chat"]:
-            encoding = tiktoken.encoding_for_model("cl100k_base")
-        else:
-            encoding = tiktoken.encoding_for_model(model_str)
-
+        anthropic_models, openai_reasoning_models, openai_gpt_models = model_names()
         if model_str.startswith("ollama:"):
             model_str = "ollama"
+
+        if model_str in [
+            *anthropic_models,
+            *openai_reasoning_models,
+        ]:
+            encoding = tiktoken.encoding_for_model("gpt-4o")
+        elif model_str in openai_gpt_models:
+            encoding = tiktoken.encoding_for_model(model_str)
+        else:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
         if model_str not in TOKENS_IN:
             TOKENS_IN[model_str] = 0
             TOKENS_OUT[model_str] = 0
@@ -81,12 +84,66 @@ def compute_tokens(model_str, prompt, system_prompt, answer, print_cost):
             print(f"Cost approximation has an error? {e}")
 
 
+def model_names():
+    anthropic_models = [
+        "claude-3-7-sonnet-latest",
+        "claude-3-7-sonnet-20250219",
+        "claude-3-5-haiku-latest",
+        "claude-3-5-haiku-20241022",
+        "claude-3-5-sonnet-latest",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-sonnet-20240620",
+        "claude-3-opus-latest",
+        "claude-3-opus-20240229",
+        "claude-3-sonnet-20240229",
+        "claude-3-haiku-20240307",
+        "claude-2.1",
+        "claude-2.0",
+    ]
+    openai_reasoning_models = [
+        "o3-mini",
+        "o3-mini-2025-01-31",
+        "o1",
+        "o1-2024-12-17",
+        "o1-preview",
+        "o1-preview-2024-09-12",
+        "o1-mini",
+        "o1-mini-2024-09-12",
+    ]
+    openai_gpt_models = [
+        "gpt-4o",
+        "gpt-4o-2024-11-20",
+        "gpt-4o-2024-08-06",
+        "gpt-4o-2024-05-13",
+        "gpt-4o-audio-preview",
+        "gpt-4o-audio-preview-2024-10-01",
+        "gpt-4o-audio-preview-2024-12-17",
+        "gpt-4o-mini-audio-preview",
+        "gpt-4o-mini-audio-preview-2024-12-17",
+        "chatgpt-4o-latest",
+        "gpt-4o-mini",
+        "gpt-4o-mini-2024-07-18",
+        "gpt-4-turbo",
+        "gpt-4-turbo-2024-04-09",
+        "gpt-4-0125-preview",
+        "gpt-4-turbo-preview",
+        "gpt-4-1106-preview",
+        "gpt-4-vision-preview",
+        "gpt-4",
+        "gpt-4-0314",
+        "gpt-4-0613",
+        "gpt-4-32k",
+        "gpt-4-32k-0314",
+        "gpt-4-32k-0613",
+    ]
+    return anthropic_models, openai_reasoning_models, openai_gpt_models
+
+
 def query_model(
     model_str: str,
     prompt: str,
     system_prompt: str,
     openai_api_key=None,
-    anthropic_api_key=None,
     tries=5,
     timeout=5.0,
     temp=None,
@@ -95,68 +152,45 @@ def query_model(
     preloaded_api = os.getenv("OPENAI_API_KEY")
     if openai_api_key is None and preloaded_api is not None:
         openai_api_key = preloaded_api
-    if openai_api_key is None and anthropic_api_key is None:
+    if openai_api_key is None:
         raise Exception("No API key provided in query_model function")
     if openai_api_key is not None:
         openai.api_key = openai_api_key
         os.environ["OPENAI_API_KEY"] = openai_api_key
-    if anthropic_api_key is not None:
-        os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
+
+    anthropic_models, openai_reasoning_models, openai_gpt_models = model_names()
 
     answer: str | None = None
     for _ in range(tries):
         try:
-            if (
-                model_str == "gpt-4o-mini"
-                or model_str == "gpt4omini"
-                or model_str == "gpt-4omini"
-                or model_str == "gpt4o-mini"
-            ):
-                model_str = "gpt-4o-mini"
+            if model_str in openai_gpt_models:
                 messages: Iterable[ChatCompletionMessageParam] = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ]
                 client = OpenAI()
-                if temp is None:
-                    completion = client.chat.completions.create(
-                        model="gpt-4o-mini-2024-07-18",
-                        messages=messages,
-                    )
-                else:
-                    completion = client.chat.completions.create(
-                        model="gpt-4o-mini-2024-07-18",
-                        messages=messages,
-                        temperature=temp,
-                    )
+                completion = client.chat.completions.create(
+                    model=model_str,
+                    messages=messages,
+                    temperature=temp,
+                )
                 answer = completion.choices[0].message.content
-            elif model_str == "claude-3.5-sonnet":
+            elif model_str in openai_reasoning_models:
+                messages = [{"role": "user", "content": system_prompt + prompt}]
+                client = OpenAI()
+                completion = client.chat.completions.create(
+                    model="o1-mini-2024-09-12", messages=messages
+                )
+                answer = completion.choices[0].message.content
+            elif model_str in anthropic_models:
                 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
                 message = client.messages.create(
-                    model="claude-3-5-sonnet-latest",
+                    model=model_str,
                     system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
+                    temperature=temp,
                 )  # type: ignore
                 answer = json.loads(message.to_json())["content"][0]["text"]
-            elif model_str == "gpt4o" or model_str == "gpt-4o":
-                model_str = "gpt-4o"
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ]
-                client = OpenAI()
-                if temp is None:
-                    completion = client.chat.completions.create(
-                        model="gpt-4o-2024-08-06",
-                        messages=messages,
-                    )
-                else:
-                    completion = client.chat.completions.create(
-                        model="gpt-4o-2024-08-06",
-                        messages=messages,
-                        temperature=temp,
-                    )
-                answer = completion.choices[0].message.content
             elif model_str == "deepseek-chat":
                 model_str = "deepseek-chat"
                 messages = [
@@ -167,37 +201,8 @@ def query_model(
                     api_key=os.getenv("DEEPSEEK_API_KEY"),
                     base_url="https://api.deepseek.com/v1",
                 )
-                if temp is None:
-                    completion = deepseek_client.chat.completions.create(
-                        model="deepseek-chat", messages=messages
-                    )
-                else:
-                    completion = deepseek_client.chat.completions.create(
-                        model="deepseek-chat", messages=messages, temperature=temp
-                    )
-                answer = completion.choices[0].message.content
-            elif model_str == "o1-mini":
-                model_str = "o1-mini"
-                messages = [{"role": "user", "content": system_prompt + prompt}]
-                client = OpenAI()
-                completion = client.chat.completions.create(
-                    model="o1-mini-2024-09-12", messages=messages
-                )
-                answer = completion.choices[0].message.content
-            elif model_str == "o1":
-                model_str = "o1"
-                messages = [{"role": "user", "content": system_prompt + prompt}]
-                client = OpenAI()
-                completion = client.chat.completions.create(
-                    model="o1-2024-12-17", messages=messages
-                )
-                answer = completion.choices[0].message.content
-            elif model_str == "o1-preview":
-                model_str = "o1-preview"
-                messages = [{"role": "user", "content": system_prompt + prompt}]
-                client = OpenAI()
-                completion = client.chat.completions.create(
-                    model="o1-preview", messages=messages
+                completion = deepseek_client.chat.completions.create(
+                    model="deepseek-chat", messages=messages, temperature=temp
                 )
                 answer = completion.choices[0].message.content
             elif model_str.startswith("ollama:"):
@@ -211,6 +216,16 @@ def query_model(
                     ],
                 )
                 answer = response.message.content
+            else:
+                possible_models = (
+                    anthropic_models
+                    + openai_reasoning_models
+                    + openai_gpt_models
+                    + ["deepseek-chat", "an ollama model"]
+                )
+                raise ValueError(
+                    f"Unknown model: {model_str} - possible models: {possible_models}"
+                )
 
             compute_tokens(model_str, prompt, system_prompt, answer, print_cost)
 
