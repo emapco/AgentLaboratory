@@ -212,7 +212,6 @@ class LaboratoryWorkflow:
         @param phase: (str) phase string
         @return: None
         """
-        subtask = subtask.replace(" ", "_")
         next_phase = self.get_next_subtask(subtask)
         if (
             next_phase
@@ -225,7 +224,7 @@ class LaboratoryWorkflow:
             )  # resumed chkpt might be an earlier phase where we want to overwrite next phases
         ):
             return
-        with open(f"state_saves/{subtask}.pkl", "wb") as f:
+        with open(f"state_saves/{subtask.replace(' ', '_')}.pkl", "wb") as f:
             pickle.dump(self, f)
 
     def get_next_subtask(self, phase_subtask):
