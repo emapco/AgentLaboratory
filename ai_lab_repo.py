@@ -220,7 +220,7 @@ class LaboratoryWorkflow:
                 f"state_saves/{next_phase}.pkl"
             )  # don't overwrite previous states when resuming
             and (
-                self.phase_status[next_phase] is False
+                self.phase_status[next_phase] is True
             )  # resumed chkpt might be an earlier phase where we want to overwrite next phases
         ):
             return
