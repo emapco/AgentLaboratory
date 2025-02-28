@@ -1,17 +1,17 @@
+import os
 import random
 import string
-from utils import *
-from tools import *
-from copy import copy
-from inference import *
-from pathlib import Path
-from copy import deepcopy
-from common_imports import *
-from agents import get_score
+import sys
 from abc import abstractmethod
-
 from contextlib import contextmanager
-import sys, os
+from copy import copy
+
+from agents import get_score
+from common_imports import *
+from inference import *
+from tools import *
+from utils import *
+
 
 @contextmanager
 def suppress_stdout():
@@ -22,6 +22,7 @@ def suppress_stdout():
             yield
         finally:
             sys.stdout = old_stdout
+
 
 class Command:
     def __init__(self):
@@ -54,6 +55,7 @@ def execute_latex():
 @@@@@@@@@@@@@@@@@@
 """
 
+
 class Arxiv(Command):
     def __init__(self):
         super().__init__()
@@ -74,22 +76,35 @@ class Arxiv(Command):
         # args[0] -> command
         # args[1] -> query
         if args[0] == "SUMMARY":
-            return self.arxiv_eng.find_papers_by_str(args[1], self.num_papers_per_search)
+            return self.arxiv_eng.find_papers_by_str(
+                args[1], self.num_papers_per_search
+            )
         elif args[0] == "FULL_TEXT":
             return self.arxiv_eng.retrieve_full_paper_text(args[1])
         raise Exception("Invalid Arxiv Search")
 
     def matches_command(self, cmd_str) -> bool:
-        if "```SUMMARY" in cmd_str: return True
-        elif "```FULL_TEXT" in cmd_str: return True
+        if "```SUMMARY" in cmd_str:
+            return True
+        elif "```FULL_TEXT" in cmd_str:
+            return True
         return False
 
     def parse_command(self, *args) -> tuple:
         sum_text = extract_prompt(args[0], "SUMMARY").split("\n")
         full_text = extract_prompt(args[0], "FULL_TEXT").split("\n")
-        if len(sum_text) == 0 and len(full_text) == 0: return False, None
-        if len(sum_text) > 0: return True, ("SUMMARY", sum_text,)
-        if len(full_text) > 0: return True, ("FULL_TEXT", sum_text,)
+        if len(sum_text) == 0 and len(full_text) == 0:
+            return False, None
+        if len(sum_text) > 0:
+            return True, (
+                "SUMMARY",
+                sum_text,
+            )
+        if len(full_text) > 0:
+            return True, (
+                "FULL_TEXT",
+                sum_text,
+            )
 
 
 """
@@ -97,6 +112,7 @@ class Arxiv(Command):
 @@ WRITING TOOLS @@
 @@@@@@@@@@@@@@@@@@@
 """
+
 
 class PaperReplace(Command):
     def __init__(self):
@@ -117,15 +133,19 @@ class PaperReplace(Command):
         return args[0]
 
     def matches_command(self, cmd_str) -> bool:
-        if "```REPLACE" in cmd_str: return True
+        if "```REPLACE" in cmd_str:
+            return True
         return False
 
     def parse_command(self, *args) -> tuple:
         new_latex = extract_prompt(args[0], "REPLACE")
         latex_ret = compile_latex(new_latex, compile=args[1])
-        if "[CODE EXECUTION ERROR]" in latex_ret: return False, (None, latex_ret,)
+        if "[CODE EXECUTION ERROR]" in latex_ret:
+            return False, (
+                None,
+                latex_ret,
+            )
         return True, (new_latex.split("\n"), latex_ret)
-
 
 
 class PaperEdit(Command):
@@ -150,7 +170,7 @@ class PaperEdit(Command):
             args = args[0]
             current_latex = args[2]
             lines_to_add = list(reversed(args[3]))
-            lines_to_replace = list(reversed(range(args[0], args[1]+1)))
+            lines_to_replace = list(reversed(range(args[0], args[1] + 1)))
             for _ln in lines_to_replace:
                 current_latex.pop(_ln)
             for _line in lines_to_add:
@@ -158,13 +178,15 @@ class PaperEdit(Command):
             new_latex = "\n".join(current_latex)
             latex_exec = f"{new_latex}"
             latex_ret = compile_latex(latex_exec, compile=args[4])
-            if "error" in latex_ret.lower(): return (False, None, latex_ret)
+            if "error" in latex_ret.lower():
+                return (False, None, latex_ret)
             return (True, current_latex, latex_ret)
         except Exception as e:
             return (False, None, str(e))
 
     def matches_command(self, cmd_str) -> bool:
-        if "```EDIT" in cmd_str: return True
+        if "```EDIT" in cmd_str:
+            return True
         return False
 
     def parse_command(self, *args) -> tuple:
@@ -172,16 +194,17 @@ class PaperEdit(Command):
         success = True
         try:
             text = extract_prompt(cmd_str, "EDIT").split("\n")
-            if len(text) == 0: return False, (None, None, None, None)
+            if len(text) == 0:
+                return False, (None, None, None, None)
             lines_to_edit = text[0].split(" ")
-            if len(lines_to_edit) != 2: return False, (None, None, None, None)
+            if len(lines_to_edit) != 2:
+                return False, (None, None, None, None)
             lines_to_edit = [int(_) for _ in lines_to_edit]
-            if len(text[1:]) == 0: return False, (None, None, None, None)
+            if len(text[1:]) == 0:
+                return False, (None, None, None, None)
             return success, (lines_to_edit[0], lines_to_edit[1], latexlines, text[1:])
         except Exception as e:
             return False, (None, None, None, None)
-
-
 
 
 # Modified version of section tips from the AI scientist paper!
@@ -242,24 +265,55 @@ Please make sure the abstract reads smoothly and is well-motivated. This should 
 """,
 }
 
+
 class PaperSolver:
-    def __init__(self, llm_str, notes=None, max_steps=10, insights=None, plan=None, exp_code=None, exp_results=None, lit_review=None, ref_papers=None, topic=None, openai_api_key=None, compile_pdf=True):
-        if notes is None: self.notes = []
-        else: self.notes = notes
-        if plan is None: self.plan = ""
-        else: self.plan = plan
-        if exp_code is None: self.exp_code = ""
-        else: self.exp_code = exp_code
-        if exp_results is None: self.exp_results = ""
-        else: self.exp_results = exp_results
-        if lit_review is None: self.lit_review = ""
-        else: self.lit_review = lit_review
-        if insights is None: self.insights = ""
-        else: self.insights = insights
-        if ref_papers is None: self.ref_papers = ""
-        else: self.ref_papers = ref_papers
-        if topic is None: self.topic = ""
-        else: self.topic = topic
+    def __init__(
+        self,
+        llm_str,
+        notes=None,
+        max_steps=10,
+        insights=None,
+        plan=None,
+        exp_code=None,
+        exp_results=None,
+        lit_review=None,
+        ref_papers=None,
+        topic=None,
+        openai_api_key=None,
+        compile_pdf=True,
+    ):
+        if notes is None:
+            self.notes = []
+        else:
+            self.notes = notes
+        if plan is None:
+            self.plan = ""
+        else:
+            self.plan = plan
+        if exp_code is None:
+            self.exp_code = ""
+        else:
+            self.exp_code = exp_code
+        if exp_results is None:
+            self.exp_results = ""
+        else:
+            self.exp_results = exp_results
+        if lit_review is None:
+            self.lit_review = ""
+        else:
+            self.lit_review = lit_review
+        if insights is None:
+            self.insights = ""
+        else:
+            self.insights = insights
+        if ref_papers is None:
+            self.ref_papers = ""
+        else:
+            self.ref_papers = ref_papers
+        if topic is None:
+            self.topic = ""
+        else:
+            self.topic = topic
         self.compile_pdf = compile_pdf
         self.llm_str = llm_str
         self.notes = notes
@@ -282,21 +336,38 @@ class PaperSolver:
             model_resp = query_model(
                 model_str=self.model,
                 system_prompt=self.system_prompt(),
-                prompt=f"\nNow please enter a command: ",
+                prompt="\nNow please enter a command: ",
                 temp=1.0,
-                openai_api_key=self.openai_api_key)
-            #print(model_resp)
+                openai_api_key=self.openai_api_key,
+            )
+            # print(model_resp)
             model_resp = self.clean_text(model_resp)
-            cmd_str, paper_lines, prev_paper_ret, score = self.process_command(model_resp)
+            cmd_str, paper_lines, prev_paper_ret, score = self.process_command(
+                model_resp
+            )
             if score is not None:
                 if top_score is None:
-                    best_pkg = copy(paper_lines), copy(prev_paper_ret), copy(model_resp), copy(cmd_str)
+                    best_pkg = (
+                        copy(paper_lines),
+                        copy(prev_paper_ret),
+                        copy(model_resp),
+                        copy(cmd_str),
+                    )
                     top_score = score
                 elif score > top_score:
-                    best_pkg = copy(paper_lines), copy(prev_paper_ret), copy(model_resp), copy(cmd_str)
+                    best_pkg = (
+                        copy(paper_lines),
+                        copy(prev_paper_ret),
+                        copy(model_resp),
+                        copy(cmd_str),
+                    )
                     top_score = score
-            if num_attempts >= self.min_gen_trials and top_score is not None: break
-            print(f"@@@ Command Exec // Attempt {num_attempts}: ", str(cmd_str).replace("\n", " | "))
+            if num_attempts >= self.min_gen_trials and top_score is not None:
+                break
+            print(
+                f"@@@ Command Exec // Attempt {num_attempts}: ",
+                str(cmd_str).replace("\n", " | "),
+            )
             print(f"$$$ Score: {score}")
             num_attempts += 1
         self.paper_lines, self.prev_paper_ret, model_resp, cmd_str = best_pkg
@@ -305,7 +376,9 @@ class PaperSolver:
             # replace the lowest scoring one
             if len(self.best_report) >= self.max_papers:
                 self.best_report.pop(-1)
-            self.best_report.append((copy(self.paper_lines), copy(top_score), self.prev_paper_ret))
+            self.best_report.append(
+                (copy(self.paper_lines), copy(top_score), self.prev_paper_ret)
+            )
             # sort by score, to make sure lowest are removed in future
             self.best_report.sort(key=lambda x: x[1], reverse=True)
         return model_resp, cmd_str
@@ -322,11 +395,13 @@ class PaperSolver:
         self.commands = [PaperReplace()]
         self.model = f"{self.llm_str}"
         init_report, init_return, self.best_score = self.gen_initial_report()
-        self.best_report = [(copy(init_report), self.best_score, init_return) for _ in range(1)]
+        self.best_report = [
+            (copy(init_report), self.best_score, init_return) for _ in range(1)
+        ]
 
         self.paper_lines = init_report
         self.model = f"{self.llm_str}"
-        self.commands = [PaperEdit()] #, Replace()]
+        self.commands = [PaperEdit()]  # , Replace()]
         self.prev_working_report = copy(self.paper_lines)
 
     @staticmethod
@@ -339,9 +414,25 @@ class PaperSolver:
         arx = ArxivSearch()
         section_scaffold = str()
         #  1. Abstract 2. Introduction, 3. Background, 4. Methods, 5. Experimental Setup 6. Results, and 7. Discussion
-        for _section in ["scaffold", "abstract", "introduction", "related work", "background", "methods", "experimental setup", "results", "discussion"]:
+        for _section in [
+            "scaffold",
+            "abstract",
+            "introduction",
+            "related work",
+            "background",
+            "methods",
+            "experimental setup",
+            "results",
+            "discussion",
+        ]:
             section_complete = False
-            if _section in ["introduction", "related work", "background", "methods", "discussion"]:
+            if _section in [
+                "introduction",
+                "related work",
+                "background",
+                "methods",
+                "discussion",
+            ]:
                 attempts = 0
                 papers = str()
                 first_attempt = True
@@ -351,8 +442,13 @@ class PaperSolver:
                         break
                     if not first_attempt:
                         att_str = "This is not your first attempt please try to come up with a simpler search query."
-                    search_query = query_model(model_str=f"{self.llm_str}", prompt=f"Given the following research topic {self.topic} and research plan: \n\n{self.plan}\n\nPlease come up with a search query to find relevant papers on arXiv. Respond only with the search query and nothing else. This should be a a string that will be used to find papers with semantically similar content. {att_str}", system_prompt=f"You are a research paper finder. You must find papers for the section {_section}. Query must be text nothing else.", openai_api_key=self.openai_api_key)
-                    search_query.replace('"', '')
+                    search_query = query_model(
+                        model_str=f"{self.llm_str}",
+                        prompt=f"Given the following research topic {self.topic} and research plan: \n\n{self.plan}\n\nPlease come up with a search query to find relevant papers on arXiv. Respond only with the search query and nothing else. This should be a a string that will be used to find papers with semantically similar content. {att_str}",
+                        system_prompt=f"You are a research paper finder. You must find papers for the section {_section}. Query must be text nothing else.",
+                        openai_api_key=self.openai_api_key,
+                    )
+                    search_query.replace('"', "")
                     papers = arx.find_papers_by_str(query=search_query, N=10)
                     first_attempt = False
                     attempts += 1
@@ -360,8 +456,10 @@ class PaperSolver:
                     self.section_related_work[_section] = papers
             while not section_complete:
                 section_scaffold_temp = copy(section_scaffold)
-                if num_attempts == 0: err = str()
-                else: err = f"The following was the previous command generated: {model_resp}. This was the error return {cmd_str}. You should make sure not to repeat this error and to solve the presented problem."
+                if num_attempts == 0:
+                    err = str()
+                else:
+                    err = f"The following was the previous command generated: {model_resp}. This was the error return {cmd_str}. You should make sure not to repeat this error and to solve the presented problem."
                 if _section == "scaffold":
                     prompt = f"{err}\nNow please enter the ```REPLACE command to create the scaffold:\n "
                 else:
@@ -374,33 +472,50 @@ class PaperSolver:
                     system_prompt=self.system_prompt(section=_section),
                     prompt=f"{prompt}",
                     temp=0.8,
-                    openai_api_key=self.openai_api_key)
+                    openai_api_key=self.openai_api_key,
+                )
                 model_resp = self.clean_text(model_resp)
                 if _section == "scaffold":
                     # minimal scaffold (some other sections can be combined)
-                    for _sect in ["[ABSTRACT HERE]", "[INTRODUCTION HERE]", "[METHODS HERE]", "[RESULTS HERE]", "[DISCUSSION HERE]"]:
+                    for _sect in [
+                        "[ABSTRACT HERE]",
+                        "[INTRODUCTION HERE]",
+                        "[METHODS HERE]",
+                        "[RESULTS HERE]",
+                        "[DISCUSSION HERE]",
+                    ]:
                         if _sect not in model_resp:
                             cmd_str = "Error: scaffold section placeholders were not present (e.g. [ABSTRACT HERE])."
                             print("@@@ INIT ATTEMPT:", cmd_str)
                             continue
                 elif _section != "scaffold":
                     new_text = extract_prompt(model_resp, "REPLACE")
-                    section_scaffold_temp = section_scaffold_temp.replace(f"[{_section.upper()} HERE]", new_text)
-                    model_resp = '```REPLACE\n' + copy(section_scaffold_temp) + '\n```'
-                    if "documentclass{article}" in new_text or "usepackage{" in new_text:
-                            cmd_str = "Error: You must not include packages or documentclass in the text! Your latex must only include the section text, equations, and tables."
-                            print("@@@ INIT ATTEMPT:", cmd_str)
-                            continue
-                cmd_str, latex_lines, prev_latex_ret, score = self.process_command(model_resp, scoring=False)
-                print(f"@@@ INIT ATTEMPT: Command Exec // Attempt {num_attempts}: ", str(cmd_str).replace("\n", " | "))
-                #print(f"$$$ Score: {score}")
+                    section_scaffold_temp = section_scaffold_temp.replace(
+                        f"[{_section.upper()} HERE]", new_text
+                    )
+                    model_resp = "```REPLACE\n" + copy(section_scaffold_temp) + "\n```"
+                    if (
+                        "documentclass{article}" in new_text
+                        or "usepackage{" in new_text
+                    ):
+                        cmd_str = "Error: You must not include packages or documentclass in the text! Your latex must only include the section text, equations, and tables."
+                        print("@@@ INIT ATTEMPT:", cmd_str)
+                        continue
+                cmd_str, latex_lines, prev_latex_ret, score = self.process_command(
+                    model_resp, scoring=False
+                )
+                print(
+                    f"@@@ INIT ATTEMPT: Command Exec // Attempt {num_attempts}: ",
+                    str(cmd_str).replace("\n", " | "),
+                )
+                # print(f"$$$ Score: {score}")
                 if score is not None:
                     section_complete = True
                     section_scaffold = "\n".join(latex_lines)
                 num_attempts += 1
             self.paper_lines = section_scaffold.split("\n")
-            print("$"*10, f"SCAFFOLD [{_section}] CREATED", "$"*10)
-        print("$"*10, "SCAFFOLD CREATED", "$"*10)
+            print("$" * 10, f"SCAFFOLD [{_section}] CREATED", "$" * 10)
+        print("$" * 10, "SCAFFOLD CREATED", "$" * 10)
         return latex_lines, prev_latex_ret, score
 
     def process_command(self, model_resp, scoring=True):
@@ -417,30 +532,51 @@ class PaperSolver:
         score = None
         prev_paper_ret = self.prev_paper_ret
         paper_lines = copy(self.paper_lines)
-        if "\\includegraphics[width=\\textwidth]{Figure_1.png}" in model_resp or "\\includegraphics[width=\\textwidth]{Figure_2.png}" in model_resp:
+        if (
+            "\\includegraphics[width=\\textwidth]{Figure_1.png}" in model_resp
+            or "\\includegraphics[width=\\textwidth]{Figure_2.png}" in model_resp
+        ):
             cwd = os.getcwd()
-            model_resp = model_resp.replace("\\includegraphics[width=\\textwidth]{Figure_1.png}", "\\includegraphics[width=\\textwidth]{" + cwd + "/Figure_1.png}")
-            model_resp = model_resp.replace("\\includegraphics[width=\\textwidth]{Figure_2.png}", "\\includegraphics[width=\\textwidth]{" + cwd + "/Figure_2.png}")
+            model_resp = model_resp.replace(
+                "\\includegraphics[width=\\textwidth]{Figure_1.png}",
+                "\\includegraphics[width=\\textwidth]{" + cwd + "/Figure_1.png}",
+            )
+            model_resp = model_resp.replace(
+                "\\includegraphics[width=\\textwidth]{Figure_2.png}",
+                "\\includegraphics[width=\\textwidth]{" + cwd + "/Figure_2.png}",
+            )
         for cmd in self.commands:
             if cmd.matches_command(model_resp):
                 # attempt to execute the paper edit command
-                if cmd.cmd_type == "PAPER-edit": # DONE
+                if cmd.cmd_type == "PAPER-edit":  # DONE
                     score = None
                     failed = True
                     success, args = cmd.parse_command(model_resp, paper_lines)
                     paper_err = f"Return from executing latex: {args[1]}"
                     if success:
                         # True, current_latex, latex_ret
-                        args = cmd.execute_command((args[0], args[1], paper_lines, args[3], self.compile_pdf))
+                        args = cmd.execute_command(
+                            (args[0], args[1], paper_lines, args[3], self.compile_pdf)
+                        )
                         success = success and args[0]
-                        if not success: pass
+                        if not success:
+                            pass
                         else:
-                            paper_lines = copy(args[1]) #
+                            paper_lines = copy(args[1])  #
                             if scoring:
-                                score, cmd_str, is_valid = get_score(self.plan, "\n".join(paper_lines), reward_model_llm=self.llm_str)
+                                score, cmd_str, is_valid = get_score(
+                                    self.plan,
+                                    "\n".join(paper_lines),
+                                    reward_model_llm=self.llm_str,
+                                )
                             else:
-                                score, cmd_str, is_valid = 0.0, "Paper scored successfully", True
-                            if is_valid: failed = False
+                                score, cmd_str, is_valid = (
+                                    0.0,
+                                    "Paper scored successfully",
+                                    True,
+                                )
+                            if is_valid:
+                                failed = False
                             paper_err += f"\nReturn from executing latex: {cmd_str}"
                         print("$$$$ PAPER EDIT (success)")
                     if failed:
@@ -451,19 +587,30 @@ class PaperSolver:
                         paper_lines = copy(args[1])
                         prev_paper_ret = copy(args[2])
                         print("$$$$ PAPER EDIT (success)")
-                elif cmd.cmd_type == "PAPER-replace": # DONE
+                elif cmd.cmd_type == "PAPER-replace":  # DONE
                     score = None
                     failed = True
                     success, args = cmd.parse_command(model_resp, self.compile_pdf)
                     paper_err = f"Return from executing latex: {args[1]}"
                     if success:
-                        paper_lines = copy(args[0]) #
+                        paper_lines = copy(args[0])  #
                         if scoring:
-                            score, cmd_str, is_valid = get_score(self.plan, "\n".join(paper_lines), reward_model_llm=self.llm_str)
+                            score, cmd_str, is_valid = get_score(
+                                self.plan,
+                                "\n".join(paper_lines),
+                                reward_model_llm=self.llm_str,
+                            )
                         else:
-                            score, cmd_str, is_valid = 0.0, "Paper scored successfully", True
-                        if is_valid: failed = False
-                        paper_err += f"\nReturn from executing code on real test set {cmd_str}"
+                            score, cmd_str, is_valid = (
+                                0.0,
+                                "Paper scored successfully",
+                                True,
+                            )
+                        if is_valid:
+                            failed = False
+                        paper_err += (
+                            f"\nReturn from executing code on real test set {cmd_str}"
+                        )
                     if failed:
                         cmd_str = f"Paper replacement FAILED due to the following error: {paper_err}.  Paper was reverted back to original state before edits."
                         print("$$$$ PAPER REPLACE (failed)")
@@ -491,17 +638,19 @@ class PaperSolver:
         @param commands: (bool) whether to use command prompt
         @return: (str) system prompt
         """
-        if section == "abstract": length = "This section should be ONLY 1 paragraph."
-        else: length = "This section should be approximately 2-4 paragraphs and so your output should be several paragraphs of latex."
+        if section == "abstract":
+            length = "This section should be ONLY 1 paragraph."
+        else:
+            length = "This section should be approximately 2-4 paragraphs and so your output should be several paragraphs of latex."
         methods_str = str()
         if section == "methods":
-            fig1_text="""\n\\begin{figure}[h]
+            fig1_text = """\n\\begin{figure}[h]
 \\caption{<caption here>}
 \\centering
 \\includegraphics[width=\\textwidth]{Figure_1.png}
 \\label{fig:fig1}
 \\end{figure}\n"""
-            fig2_text="""\n\\begin{figure}[h]
+            fig2_text = """\n\\begin{figure}[h]
 \\caption{<caption here>}
 \\centering
 \\includegraphics[width=\\textwidth]{Figure_2.png}
@@ -513,21 +662,38 @@ class PaperSolver:
                 methods_str += f"You ABSOLUTELY must without fail also include Figure_1.png in your paper using {fig1_text} on a new line.\n"
             elif os.path.exists("Figure_2.png"):
                 methods_str += f"You ABSOLUTELY must without fail also include Figure_2.png in your paper using {fig2_text} on a new line.\n"
-        if section is not None and section == "scaffold": section_cmd = f"Your objective right now is to only build the scaffolding for the paper. You should not include any text in the body of the paper, but should have an empty scaffold for each of the sections.  Where the sections go, write [ABSTRACT HERE] for abstract, and write [INTRODUCTION HERE] for the introduction... etc. Your paper should have the following sections: 1. Abstract 2. Introduction, 3. Background, 4. Related Work 5. Methods, 6. Experimental Setup 7. Results, and 8. Discussion. Just create the scaffolding as compilable latex. Your title should start with Research Report: [title here] where title here is a title you choose. For author write Agent Laboratory."
-        elif section is not None: section_cmd = f"Your only goal is to generate latex for the following {section}. DO NOT INCLUDE ANY PACKAGES OR ANY SECTION COMMANDS. DO NOT INCLUDE A TITLE OR DATE ONLY TEXT. You only have to generate text for this specific section and do not have to output anything else. {length} I repeat DO NOT INCLUDE ANY PACKAGES OR ANY SECTION COMMANDS. DO NOT INCLUDE A TITLE OR DATE ONLY TEXT. Use as many equations as you find necessary. You should include mathematical equations, numbers, and tables where necessary. Remember that to include a percentage sign % you must add a backslash \% or else it will become a comment. Here are some tips {per_section_tips[section]}  {methods_str}.\n\n"
-        else: section_cmd = ""
-        paper_len = sum([i.strip(string.punctuation).isalpha() for i in ("".join(self.paper_lines)).split()])
-        #paper_len2 = len(("".join(self.paper_lines)).split())
-        if paper_len < 4000: paper_progress = f"The current length of the paper is {paper_len} words, you must increase this by {4000-paper_len} words."
-        else: paper_progress = ""
-        print(paper_progress)
-        cmd_set = f"The following are commands you have access to: {self.command_descriptions()}\n." if commands else ""
-        if len(self.ref_papers) == 0: ref_papers = ""
+        if section is not None and section == "scaffold":
+            section_cmd = "Your objective right now is to only build the scaffolding for the paper. You should not include any text in the body of the paper, but should have an empty scaffold for each of the sections.  Where the sections go, write [ABSTRACT HERE] for abstract, and write [INTRODUCTION HERE] for the introduction... etc. Your paper should have the following sections: 1. Abstract 2. Introduction, 3. Background, 4. Related Work 5. Methods, 6. Experimental Setup 7. Results, and 8. Discussion. Just create the scaffolding as compilable latex. Your title should start with Research Report: [title here] where title here is a title you choose. For author write Agent Laboratory."
+        elif section is not None:
+            section_cmd = f"Your only goal is to generate latex for the following {section}. DO NOT INCLUDE ANY PACKAGES OR ANY SECTION COMMANDS. DO NOT INCLUDE A TITLE OR DATE ONLY TEXT. You only have to generate text for this specific section and do not have to output anything else. {length} I repeat DO NOT INCLUDE ANY PACKAGES OR ANY SECTION COMMANDS. DO NOT INCLUDE A TITLE OR DATE ONLY TEXT. Use as many equations as you find necessary. You should include mathematical equations, numbers, and tables where necessary. Remember that to include a percentage sign % you must add a backslash \% or else it will become a comment. Here are some tips {per_section_tips[section]}  {methods_str}.\n\n"
         else:
-            refpapers = '\n'.join(self.ref_papers)
-            ref_papers = f"Here is a reference paper that is high quality:\n{refpapers}\n\n\n"
+            section_cmd = ""
+        paper_len = sum(
+            [
+                i.strip(string.punctuation).isalpha()
+                for i in ("".join(self.paper_lines)).split()
+            ]
+        )
+        max_paper_len = int(os.environ.get("PAPER_SOLVER_PAPER_LENGTH", 4000))
+        if paper_len < max_paper_len:
+            paper_progress = f"The current length of the paper is {paper_len} words, you must increase this by {max_paper_len - paper_len} words."
+        else:
+            paper_progress = ""
+        print(paper_progress)
+        cmd_set = (
+            f"The following are commands you have access to: {self.command_descriptions()}\n."
+            if commands
+            else ""
+        )
+        if len(self.ref_papers) == 0:
+            ref_papers = ""
+        else:
+            refpapers = "\n".join(self.ref_papers)
+            ref_papers = (
+                f"Here is a reference paper that is high quality:\n{refpapers}\n\n\n"
+            )
         lit_review_str = str(self.lit_review)[:20000]
-        #print(len(f"{self.exp_results}"), len(f"{self.exp_code}"), len(f"{self.plan}"), len(f"{self.lit_review}"), len(f"{self.role_description()}"), len(f"{self.phase_prompt()}"), len(f"{self.generate_paper_lines(self.paper_lines)}"), len(f"{section_cmd}"), len(f"{cmd_set}"), len(f"{ref_papers}"))
+        # print(len(f"{self.exp_results}"), len(f"{self.exp_code}"), len(f"{self.plan}"), len(f"{self.lit_review}"), len(f"{self.role_description()}"), len(f"{self.phase_prompt()}"), len(f"{self.generate_paper_lines(self.paper_lines)}"), len(f"{section_cmd}"), len(f"{cmd_set}"), len(f"{ref_papers}"))
         return (
             f"{ref_papers}"
             # ROLE DESCRIPTION
@@ -548,7 +714,7 @@ class PaperSolver:
             f"Provided was an interpretation of the experimental results:\n{self.insights}\n"
             f"Your writing style should be boring and objective.\n"
             # transition
-            f"Your goal is to write a research paper as well as possible. You will receive a score after you write the paper and should aim to maximize the score by writing a high quality research paper. The paper length should be 8 pages or 4000 words in total. It should be quite long and comprehensive. Remember, the paper MUST BE LONG. {paper_progress}\n"
+            f"Your goal is to write a research paper as well as possible. You will receive a score after you write the paper and should aim to maximize the score by writing a high quality research paper. The paper length should be 8 pages or {max_paper_len} words in total. It should be quite long and comprehensive. Remember, the paper MUST BE LONG. {paper_progress}\n"
             # COMMAND SET
             f"{cmd_set}\n"
             # PAPER
@@ -563,25 +729,24 @@ class PaperSolver:
         @return: (str) command descriptions
         """
         cmd_strings = "\n".join([_cmd.docstring() for _cmd in self.commands])
-        return f"\nYou also have access to tools which can be interacted with using the following structure: ```COMMAND\n<command information here>\n```, where COMMAND is whichever command you want to run (e.g. EDIT,...), <command information here> is information used for the command and ``` are meant to encapsulate the command. ``` must be included as part of the command both at the beginning and at the end of the command. DO NOT FORGOT TO HAVE ``` AT THE TOP AND BOTTOM OF COMMAND. and this structure must be followed to execute a command correctly. YOU CAN ONLY EXECUTE A SINGLE COMMAND AT A TIME! Do not try to perform multiple commands EVER only one." + cmd_strings
+        return (
+            "\nYou also have access to tools which can be interacted with using the following structure: ```COMMAND\n<command information here>\n```, where COMMAND is whichever command you want to run (e.g. EDIT,...), <command information here> is information used for the command and ``` are meant to encapsulate the command. ``` must be included as part of the command both at the beginning and at the end of the command. DO NOT FORGOT TO HAVE ``` AT THE TOP AND BOTTOM OF COMMAND. and this structure must be followed to execute a command correctly. YOU CAN ONLY EXECUTE A SINGLE COMMAND AT A TIME! Do not try to perform multiple commands EVER only one."
+            + cmd_strings
+        )
 
     def role_description(self):
         """
         Provide role description
         @return: (str) role description
         """
-        return "You are a computer science PhD student at a top university who has submitted their paper to an ML conference called ICLR. Your goal was to write a research paper and get high scores from the reviewers so that it get accepted to the conference. Your paper should be approximately 8 pages and around 4000 words. Your article should ONLY CONTAIN EIGHT sections as follows: 1. Abstract 2. Introduction, 3. Background, 4. Related Work 5. Methods, 6. Experimental Setup 7. Results, and 8. Discussion.\n"
+        return "You are a computer science PhD student at a top university who has submitted their paper to an ML conference called ICLR. Your goal was to write a research paper and get high scores from the reviewers so that it get accepted to the conference. Your paper should be approximately 8 pages and around {max_paper_len} words. Your article should ONLY CONTAIN EIGHT sections as follows: 1. Abstract 2. Introduction, 3. Background, 4. Related Work 5. Methods, 6. Experimental Setup 7. Results, and 8. Discussion.\n"
 
-
-    def phase_prompt(self,):
+    def phase_prompt(
+        self,
+    ):
         """
         Describe system role and general tips for mle-solver
         @return: (str) system role
         """
-        phase_str = (
-            "You are a PhD student who has submitted a paper to an ML conference called ICLR. Your goal was to write a research paper and get high scores from the reviewers so that it get accepted to the conference.\n"
-        )
+        phase_str = "You are a PhD student who has submitted a paper to an ML conference called ICLR. Your goal was to write a research paper and get high scores from the reviewers so that it get accepted to the conference.\n"
         return phase_str
-
-
-

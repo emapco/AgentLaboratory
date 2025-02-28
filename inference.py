@@ -189,7 +189,7 @@ def query_model(
                 client: OpenAI = MODEL_CLIENTS.get(model_str, OpenAI())
                 MODEL_CLIENTS[model_str] = client
                 completion = client.chat.completions.create(
-                    model="o1-mini-2024-09-12", messages=messages
+                    model=model_str, messages=messages
                 )
                 answer = completion.choices[0].message.content
             elif model_str in anthropic_models:
@@ -219,7 +219,7 @@ def query_model(
                 )
                 MODEL_CLIENTS[model_str] = client
                 completion = client.chat.completions.create(
-                    model="deepseek-chat", messages=messages, temperature=temp
+                    model=model_str, messages=messages, temperature=temp
                 )
                 answer = completion.choices[0].message.content
             elif model_str.startswith("fireworks:"):
@@ -262,7 +262,11 @@ def query_model(
                     anthropic_models
                     + openai_reasoning_models
                     + openai_gpt_models
-                    + ["deepseek-chat", "an ollama model"]
+                    + [
+                        "deepseek-chat",
+                        "an ollama model prefixed with 'ollama:'",
+                        "a fireworks model prefixed with 'fireworks:'",
+                    ]
                 )
                 raise ValueError(
                     f"Unknown model: {model_str} - possible models: {possible_models}"

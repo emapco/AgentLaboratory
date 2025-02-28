@@ -1,0 +1,80 @@
+defaults:
+  - _self_
+
+##########################################################
+# Research question that the agents are going to explore #
+##########################################################
+copilot_mode: false # user will be asked to provide a research question and assistance
+research_topic: null
+
+# General settings
+print_costs: true
+verbose: true
+compile_latex: false
+language: English
+paper_length: 3000 # best effort - actual length may vary based on workflow.papersolver_max_steps
+api_keys:
+  openai: null
+  deepseek: null
+  anthropic: null
+  fireworks: null
+  ollama: dummy-not-used
+
+# State loading
+load_existing: false
+load_existing_path: null
+
+# LLM settings
+# ollama models need to be prefixed with `ollama:`
+# fireworks models need to be prefixed with `fireworks:`
+llm_backend: ollama:deepseek-r1:14b-qwen-distill-q8_0
+ollama_host: http://localhost:11434
+
+workflow:
+  num_papers_lit_review: 5
+  mlesolver_max_steps: 3
+  papersolver_max_steps: 5
+
+###################################################
+###  LLM Backend used for the different phases  ###
+###################################################
+agent_models:
+  literature_review: ${llm_backend}
+  plan_formulation: ${llm_backend}
+  data_preparation: ${llm_backend}
+  running_experiments: ${llm_backend}
+  results_interpretation: ${llm_backend}
+  report_writing: ${llm_backend}
+  report_refinement: ${llm_backend}
+
+####################################################
+###  Stages where human input will be requested  ###
+####################################################
+human_in_loop:
+  literature_review: ${copilot_mode}
+  plan_formulation: ${copilot_mode}
+  data_preparation: ${copilot_mode}
+  running_experiments: ${copilot_mode}
+  results_interpretation: ${copilot_mode}
+  report_writing: ${copilot_mode}
+  report_refinement: ${copilot_mode}
+
+task_notes:
+  - phases: [plan formulation]
+    notes:
+      - "You should come up with a plan for TWO experiments."
+
+  - phases: [plan formulation, data preparation, running experiments]
+    notes:
+      - "Please use gpt-4o-mini for your experiments."
+
+  - phases: [running experiments]
+    notes:
+      - "Use the following code to inference gpt-4o-mini: \nfrom openai import OpenAI\nos.environ[\"OPENAI_API_KEY\"] = \"${api_keys.openai}\"\nclient = OpenAI()\ncompletion = client.chat.completions.create(\nmodel=\"gpt-4o-mini-2024-07-18\", messages=messages)\nanswer = completion.choices[0].message.content\n"
+      - "You have access to only gpt-4o-mini using the OpenAI API, please use the following key ${api_keys.openai} but do not use too many inferences. Do not use openai.ChatCompletion.create or any openai==0.28 commands. Instead use the provided inference code."
+      - "I would recommend using a small dataset (approximately only 256 data points) to run experiments in order to save time. Do not use much more than this unless you have to or are running the final tests."
+
+  - phases: [data preparation, running experiments]
+    notes:
+      - "You are running on a Linux system. You can use 'cuda' with PyTorch"
+      - "Generate figures with very colorful and artistic design."

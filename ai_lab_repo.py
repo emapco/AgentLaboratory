@@ -1,17 +1,63 @@
-from agents import *
+import os
+import pickle
+import sys
+import time
 from copy import copy
-from common_imports import *
-from mlesolver import MLESolver
+
+import hydra
+from omegaconf import DictConfig
 from torch.backends.mkl import verbose
 
-import argparse
-import pickle
+from agents import (
+    MLEngineerAgent,
+    PhDStudentAgent,
+    PostdocAgent,
+    ProfessorAgent,
+    ReviewersAgent,
+    SWEngineerAgent,
+)
+from common_imports import *  # noqa: F403
+from mlesolver import MLESolver
+from papersolver import PaperSolver
+from tools import ArxivSearch, HFDataSearch, execute_code
+from utils import extract_prompt, remove_directory, remove_figures, save_to_file
 
-DEFAULT_LLM_BACKBONE = "o1-mini"
+
+def setup_logging():
+    class PrintLogger:
+        def __init__(self, filename):
+            self.terminal = sys.stdout
+            self.log = open(filename, "a")
+
+        def write(self, message):
+            self.terminal.write(message)
+            self.log.write(message)
+            self.log.flush()
+
+        def flush(self):
+            self.terminal.flush()
+            self.log.flush()
+
+    sys.stdout = PrintLogger("agent_lab_log.txt")
 
 
 class LaboratoryWorkflow:
-    def __init__(self, research_topic, openai_api_key, max_steps=100, num_papers_lit_review=5, agent_model_backbone=f"{DEFAULT_LLM_BACKBONE}", notes=list(), human_in_loop_flag=None, compile_pdf=True, mlesolver_max_steps=3, papersolver_max_steps=5):
+    def __init__(
+        self,
+        research_topic,
+        openai_api_key,
+        default_llm_backend: str,
+        agent_model_backbone: dict[str, str],
+        max_steps=100,
+        num_papers_lit_review=5,
+        notes=list(),
+        human_in_loop_flag: dict | None = None,
+        compile_pdf=True,
+        verbose=True,
+        print_costs=True,
+        mlesolver_max_steps=3,
+        papersolver_max_steps=5,
+    ):
         """
         Initialize laboratory workflow
         @param research_topic: (str) description of research idea to explore
@@ -26,12 +72,13 @@ class LaboratoryWorkflow:
         self.compile_pdf = compile_pdf
         self.openai_api_key = openai_api_key
         self.research_topic = research_topic
+        self.default_llm_backend = default_llm_backend
         self.model_backbone = agent_model_backbone
         self.num_papers_lit_review = num_papers_lit_review
 
-        self.print_cost = True
-        self.review_override = True # should review be overridden?
-        self.review_ovrd_steps = 0 # review steps so far
+        self.print_cost = print_costs
+        self.review_override = True  # should review be overridden?
+        self.review_ovrd_steps = 0  # review steps so far
         self.arxiv_paper_exp_time = 3
         self.reference_papers = list()
 
@@ -39,7 +86,7 @@ class LaboratoryWorkflow:
         ####### COMPUTE BUDGET PARAMETERS ########
         ##########################################
         self.num_ref_papers = 1
-        self.review_total_steps = 0 # num steps to take if overridden
+        self.review_total_steps = 0  # num steps to take if overridden
         self.arxiv_num_summaries = 5
         self.mlesolver_max_steps = mlesolver_max_steps
         self.papersolver_max_steps = papersolver_max_steps
@@ -48,53 +95,106 @@ class LaboratoryWorkflow:
             ("literature review", ["literature review"]),
             ("plan formulation", ["plan formulation"]),
             ("experimentation", ["data preparation", "running experiments"]),
-            ("results interpretation", ["results interpretation", "report writing", "report refinement"]),
+            (
+                "results interpretation",
+                ["results interpretation", "report writing", "report refinement"],
+            ),
         ]
         self.phase_status = dict()
         for phase, subtasks in self.phases:
             for subtask in subtasks:
                 self.phase_status[subtask] = False
 
-        self.phase_models = dict()
-        if type(agent_model_backbone) == str:
-            for phase, subtasks in self.phases:
-                for subtask in subtasks:
-                    self.phase_models[subtask] = agent_model_backbone
-        elif type(agent_model_backbone) == dict:
-            # todo: check if valid
-            self.phase_models = agent_model_backbone
+        # validate agent_model_backbone contains a llm for each subtask
+        valid_subtasks = [subtask for phase in self.phases for subtask in phase[1]]
+        for phase, llm in agent_model_backbone.items():
+            if phase not in valid_subtasks:
+                raise ValueError(f"Invalid phase: {phase}")
+            valid_subtasks.remove(phase)
+        if len(valid_subtasks) != 0:
+            raise ValueError(f"Missing subtasks: {valid_subtasks}")
 
-
-        self.human_in_loop_flag = human_in_loop_flag
+        self.phase_models = agent_model_backbone
+        self.human_in_loop_flag: dict = human_in_loop_flag or dict()
 
         self.statistics_per_phase = {
-            "literature review":      {"time": 0.0, "steps": 0.0,},
-            "plan formulation":       {"time": 0.0, "steps": 0.0,},
-            "data preparation":       {"time": 0.0, "steps": 0.0,},
-            "running experiments":    {"time": 0.0, "steps": 0.0,},
-            "results interpretation": {"time": 0.0, "steps": 0.0,},
-            "report writing":         {"time": 0.0, "steps": 0.0,},
-            "report refinement":      {"time": 0.0, "steps": 0.0,},
+            "literature review": {
+                "time": 0.0,
+                "steps": 0.0,
+            },
+            "plan formulation": {
+                "time": 0.0,
+                "steps": 0.0,
+            },
+            "data preparation": {
+                "time": 0.0,
+                "steps": 0.0,
+            },
+            "running experiments": {
+                "time": 0.0,
+                "steps": 0.0,
+            },
+            "results interpretation": {
+                "time": 0.0,
+                "steps": 0.0,
+            },
+            "report writing": {
+                "time": 0.0,
+                "steps": 0.0,
+            },
+            "report refinement": {
+                "time": 0.0,
+                "steps": 0.0,
+            },
         }
 
         self.save = True
-        self.verbose = True
-        self.reviewers = ReviewersAgent(model=self.model_backbone, notes=self.notes, openai_api_key=self.openai_api_key)
-        self.phd = PhDStudentAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
-        self.postdoc = PostdocAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
-        self.professor = ProfessorAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
-        self.ml_engineer = MLEngineerAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
-        self.sw_engineer = SWEngineerAgent(model=self.model_backbone, notes=self.notes, max_steps=self.max_steps, openai_api_key=self.openai_api_key)
+        self.verbose = verbose
+        self.reviewers = ReviewersAgent(
+            model=self.model_backbone,  # type: ignore
+            notes=self.notes,
+            openai_api_key=self.openai_api_key,
+        )
+        self.phd = PhDStudentAgent(
+            model=self.model_backbone,  # type: ignore
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+        )
+        self.postdoc = PostdocAgent(
+            model=self.model_backbone,  # type: ignore
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+        )
+        self.professor = ProfessorAgent(
+            model=self.model_backbone,  # type: ignore
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+        )
+        self.ml_engineer = MLEngineerAgent(
+            model=self.model_backbone,  # type: ignore
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+        )
+        self.sw_engineer = SWEngineerAgent(
+            model=self.model_backbone,  # type: ignore
+            notes=self.notes,
+            max_steps=self.max_steps,
+            openai_api_key=self.openai_api_key,
+        )
 
         # remove previous files
         remove_figures()
         remove_directory("research_dir")
         # make src and research directory
         if not os.path.exists("state_saves"):
-            os.mkdir(os.path.join(".", "state_saves"))
-        os.mkdir(os.path.join(".", "research_dir"))
-        os.mkdir(os.path.join("./research_dir", "src"))
-        os.mkdir(os.path.join("./research_dir", "tex"))
+            os.mkdir("state_saves")
+        os.mkdir(os.path.join("research_dir"))
+        os.mkdir(os.path.join("research_dir", "src"))
+        os.mkdir(os.path.join("research_dir", "tex"))
 
     def set_model(self, model):
         self.set_agent_attr("model", model)
@@ -141,49 +241,77 @@ class LaboratoryWorkflow:
         """
         for phase, subtasks in self.phases:
             phase_start_time = time.time()  # Start timing the phase
-            if self.verbose: print(f"{'*'*50}\nBeginning phase: {phase}\n{'*'*50}")
+            if self.verbose:
+                print(f"{'*' * 50}\nBeginning phase: {phase}\n{'*' * 50}")
             for subtask in subtasks:
-                if self.verbose: print(f"{'&'*30}\nBeginning subtask: {subtask}\n{'&'*30}")
-                if type(self.phase_models) == dict:
+                if self.verbose:
+                    print(f"{'&' * 30}\nBeginning subtask: {subtask}\n{'&' * 30}")
+                if type(self.phase_models) is dict:
                     if subtask in self.phase_models:
                         self.set_model(self.phase_models[subtask])
-                    else: self.set_model(f"{DEFAULT_LLM_BACKBONE}")
-                if (subtask not in self.phase_status or not self.phase_status[subtask]) and subtask == "literature review":
+                    else:
+                        self.set_model(DEFAULT_LLM_BACKEND)
+                if (
+                    subtask not in self.phase_status or not self.phase_status[subtask]
+                ) and subtask == "literature review":
                     repeat = True
-                    while repeat: repeat = self.literature_review()
+                    while repeat:
+                        repeat = self.literature_review()
                     self.phase_status[subtask] = True
-                if (subtask not in self.phase_status or not self.phase_status[subtask]) and subtask == "plan formulation":
+                if (
+                    subtask not in self.phase_status or not self.phase_status[subtask]
+                ) and subtask == "plan formulation":
                     repeat = True
-                    while repeat: repeat = self.plan_formulation()
+                    while repeat:
+                        repeat = self.plan_formulation()
                     self.phase_status[subtask] = True
-                if (subtask not in self.phase_status or not self.phase_status[subtask]) and subtask == "data preparation":
+                if (
+                    subtask not in self.phase_status or not self.phase_status[subtask]
+                ) and subtask == "data preparation":
                     repeat = True
-                    while repeat: repeat = self.data_preparation()
+                    while repeat:
+                        repeat = self.data_preparation()
                     self.phase_status[subtask] = True
-                if (subtask not in self.phase_status or not self.phase_status[subtask]) and subtask == "running experiments":
+                if (
+                    subtask not in self.phase_status or not self.phase_status[subtask]
+                ) and subtask == "running experiments":
                     repeat = True
-                    while repeat: repeat = self.running_experiments()
+                    while repeat:
+                        repeat = self.running_experiments()
                     self.phase_status[subtask] = True
-                if (subtask not in self.phase_status or not self.phase_status[subtask]) and subtask == "results interpretation":
+                if (
+                    subtask not in self.phase_status or not self.phase_status[subtask]
+                ) and subtask == "results interpretation":
                     repeat = True
-                    while repeat: repeat = self.results_interpretation()
+                    while repeat:
+                        repeat = self.results_interpretation()
                     self.phase_status[subtask] = True
-                if (subtask not in self.phase_status or not self.phase_status[subtask]) and subtask == "report writing":
+                if (
+                    subtask not in self.phase_status or not self.phase_status[subtask]
+                ) and subtask == "report writing":
                     repeat = True
-                    while repeat: repeat = self.report_writing()
+                    while repeat:
+                        repeat = self.report_writing()
                     self.phase_status[subtask] = True
-                if (subtask not in self.phase_status or not self.phase_status[subtask]) and subtask == "report refinement":
+                if (
+                    subtask not in self.phase_status or not self.phase_status[subtask]
+                ) and subtask == "report refinement":
                     return_to_exp_phase = self.report_refinement()
 
                     if not return_to_exp_phase:
-                        if self.save: self.save_state(subtask)
+                        if self.save:
+                            self.save_state(subtask)
                         return
 
                     self.set_agent_attr("second_round", return_to_exp_phase)
                     self.set_agent_attr("prev_report", copy(self.phd.report))
                     self.set_agent_attr("prev_exp_results", copy(self.phd.exp_results))
-                    self.set_agent_attr("prev_results_code", copy(self.phd.results_code))
-                    self.set_agent_attr("prev_interpretation", copy(self.phd.interpretation))
+                    self.set_agent_attr(
+                        "prev_results_code", copy(self.phd.results_code)
+                    )
+                    self.set_agent_attr(
+                        "prev_interpretation", copy(self.phd.interpretation)
+                    )
 
                     self.phase_status["plan formulation"] = False
                     self.phase_status["data preparation"] = False
@@ -192,7 +320,8 @@ class LaboratoryWorkflow:
                     self.phase_status["report writing"] = False
                     self.phase_status["report refinement"] = False
                     self.perform_research()
-                if self.save: self.save_state(subtask)
+                if self.save:
+                    self.save_state(subtask)
                 # Calculate and print the duration of the phase
                 phase_end_time = time.time()
                 phase_duration = phase_end_time - phase_start_time
@@ -208,7 +337,9 @@ class LaboratoryWorkflow:
         print("Reviews:", reviews)
         if self.human_in_loop_flag["report refinement"]:
             print(f"Provided are reviews from a set of three reviewers: {reviews}")
-            input("Would you like to be completed with the project or should the agents go back and improve their experimental results?\n (y) for go back (n) for complete project: ")
+            input(
+                "Would you like to be completed with the project or should the agents go back and improve their experimental results?\n (y) for go back (n) for complete project: "
+            )
         else:
             review_prompt = f"Provided are reviews from a set of three reviewers: {reviews}. Would you like to be completed with the project or do you want to go back to the planning phase and improve your experiments?\n Type y and nothing else to go back, type n and nothing else for complete project."
             self.phd.phases.append("report refinement")
@@ -220,17 +351,26 @@ class LaboratoryWorkflow:
                     self.review_ovrd_steps += 1
             else:
                 response = self.phd.inference(
-                    research_topic=self.research_topic, phase="report refinement", feedback=review_prompt, step=0)
+                    research_topic=self.research_topic,
+                    phase="report refinement",
+                    feedback=review_prompt,
+                    step=0,
+                )
             if len(response) == 0:
                 raise Exception("Model did not respond")
             response = response.lower().strip()[0]
             if response == "n":
-                if verbose: print("*"*40, "\n", "REVIEW COMPLETE", "\n", "*"*40)
+                if verbose:
+                    print("*" * 40, "\n", "REVIEW COMPLETE", "\n", "*" * 40)
                 return False
             elif response == "y":
-                self.set_agent_attr("reviewer_response", f"Provided are reviews from a set of three reviewers: {reviews}.")
+                self.set_agent_attr(
+                    "reviewer_response",
+                    f"Provided are reviews from a set of three reviewers: {reviews}.",
+                )
                 return True
-            else: raise Exception("Model did not respond")
+            else:
+                raise Exception("Model did not respond")
 
     def report_writing(self):
         """
@@ -238,12 +378,33 @@ class LaboratoryWorkflow:
         @return: (bool) whether to repeat the phase
         """
         # experiment notes
-        report_notes = [_note["note"] for _note in self.ml_engineer.notes if "report writing" in _note["phases"]]
-        report_notes = f"Notes for the task objective: {report_notes}\n" if len(report_notes) > 0 else ""
-        # instantiate mle-solver
-        from papersolver import PaperSolver
+        report_notes = [
+            _note["note"]
+            for _note in self.ml_engineer.notes
+            if "report writing" in _note["phases"]
+        ]
+        report_notes = (
+            f"Notes for the task objective: {report_notes}\n"
+            if len(report_notes) > 0
+            else ""
+        )
+
         self.reference_papers = []
-        solver = PaperSolver(notes=report_notes, max_steps=self.papersolver_max_steps, plan=lab.phd.plan, exp_code=lab.phd.results_code, exp_results=lab.phd.exp_results, insights=lab.phd.interpretation, lit_review=lab.phd.lit_review, ref_papers=self.reference_papers, topic=research_topic, openai_api_key=self.openai_api_key, llm_str=self.model_backbone["report writing"], compile_pdf=compile_pdf)
+        # instantiate mle-solver
+        solver = PaperSolver(
+            notes=report_notes,
+            max_steps=self.papersolver_max_steps,
+            plan=self.phd.plan,
+            exp_code=self.phd.results_code,
+            exp_results=self.phd.exp_results,
+            insights=self.phd.interpretation,
+            lit_review=self.phd.lit_review,
+            ref_papers=self.reference_papers,
+            topic=self.research_topic,
+            openai_api_key=self.openai_api_key,
+            llm_str=self.model_backbone["report writing"],  # type: ignore
+            compile_pdf=self.compile_pdf,
+        )
         # run initialization for solver
         solver.initial_solve()
         # run solver for N mle optimization steps
@@ -252,10 +413,12 @@ class LaboratoryWorkflow:
         # get best report results
         report = "\n".join(solver.best_report[0][0])
         score = solver.best_report[0][1]
-        if self.verbose: print(f"Report writing completed, reward function score: {score}")
+        if self.verbose:
+            print(f"Report writing completed, reward function score: {score}")
         if self.human_in_loop_flag["report writing"]:
             retry = self.human_in_loop("report writing", report)
-            if retry: return retry
+            if retry:
+                return retry
         self.set_agent_attr("report", report)
         readme = self.professor.generate_readme()
         save_to_file("./research_dir", "readme.md", readme)
@@ -272,30 +435,47 @@ class LaboratoryWorkflow:
         dialogue = str()
         # iterate until max num tries to complete task is exhausted
         for _i in range(max_tries):
-            resp = self.postdoc.inference(self.research_topic, "results interpretation", feedback=dialogue, step=_i)
-            if self.verbose: print("Postdoc: ", resp, "\n~~~~~~~~~~~")
+            resp = self.postdoc.inference(
+                self.research_topic,
+                "results interpretation",
+                feedback=dialogue,
+                step=_i,
+            )
+            if self.verbose:
+                print("Postdoc: ", resp, "\n~~~~~~~~~~~")
             dialogue = str()
             if "```DIALOGUE" in resp:
                 dialogue = extract_prompt(resp, "DIALOGUE")
                 dialogue = f"The following is dialogue produced by the postdoctoral researcher: {dialogue}"
-                if self.verbose: print("#"*40, "\n", "Postdoc Dialogue:", dialogue, "\n", "#"*40)
+                if self.verbose:
+                    print("#" * 40, "\n", "Postdoc Dialogue:", dialogue, "\n", "#" * 40)
             if "```INTERPRETATION" in resp:
                 interpretation = extract_prompt(resp, "INTERPRETATION")
                 if self.human_in_loop_flag["results interpretation"]:
                     retry = self.human_in_loop("results interpretation", interpretation)
-                    if retry: return retry
+                    if retry:
+                        return retry
                 self.set_agent_attr("interpretation", interpretation)
                 # reset agent state
                 self.reset_agents()
                 self.statistics_per_phase["results interpretation"]["steps"] = _i
                 return False
-            resp = self.phd.inference(self.research_topic, "results interpretation", feedback=dialogue, step=_i)
-            if self.verbose: print("PhD Student: ", resp, "\n~~~~~~~~~~~")
+            resp = self.phd.inference(
+                self.research_topic,
+                "results interpretation",
+                feedback=dialogue,
+                step=_i,
+            )
+            if self.verbose:
+                print("PhD Student: ", resp, "\n~~~~~~~~~~~")
             dialogue = str()
             if "```DIALOGUE" in resp:
                 dialogue = extract_prompt(resp, "DIALOGUE")
-                dialogue = f"The following is dialogue produced by the PhD student: {dialogue}"
-                if self.verbose: print("#"*40, "\n", "PhD Dialogue:", dialogue, "#"*40, "\n")
+                dialogue = (
+                    f"The following is dialogue produced by the PhD student: {dialogue}"
+                )
+                if self.verbose:
+                    print("#" * 40, "\n", "PhD Dialogue:", dialogue, "#" * 40, "\n")
         raise Exception("Max tries during phase: Results Interpretation")
 
     def running_experiments(self):
@@ -304,14 +484,30 @@ class LaboratoryWorkflow:
         @return: (bool) whether to repeat the phase
         """
         # experiment notes
-        experiment_notes = [_note["note"] for _note in self.ml_engineer.notes if "running experiments" in _note["phases"]]
-        experiment_notes = f"Notes for the task objective: {experiment_notes}\n" if len(experiment_notes) > 0 else ""
+        experiment_notes = [
+            _note["note"]
+            for _note in self.ml_engineer.notes
+            if "running experiments" in _note["phases"]
+        ]
+        experiment_notes = (
+            f"Notes for the task objective: {experiment_notes}\n"
+            if len(experiment_notes) > 0
+            else ""
+        )
         # instantiate mle-solver
-        solver = MLESolver(dataset_code=self.ml_engineer.dataset_code, notes=experiment_notes, insights=self.ml_engineer.lit_review_sum, max_steps=self.mlesolver_max_steps, plan=self.ml_engineer.plan, openai_api_key=self.openai_api_key, llm_str=self.model_backbone["running experiments"])
+        solver = MLESolver(
+            dataset_code=self.ml_engineer.dataset_code,
+            notes=experiment_notes,
+            insights=self.ml_engineer.lit_review_sum,
+            max_steps=self.mlesolver_max_steps,
+            plan=self.ml_engineer.plan,
+            openai_api_key=self.openai_api_key,
+            llm_str=self.model_backbone["running experiments"],  # type: ignore
+        )
         # run initialization for solver
         solver.initial_solve()
         # run solver for N mle optimization steps
-        for _ in range(self.mlesolver_max_steps-1):
+        for _ in range(self.mlesolver_max_steps - 1):
             solver.solve()
         # get best code results
         code = "\n".join(solver.best_codes[0][0])
@@ -319,10 +515,12 @@ class LaboratoryWorkflow:
         execute_code(code)
         score = solver.best_codes[0][1]
         exp_results = solver.best_codes[0][2]
-        if self.verbose: print(f"Running experiments completed, reward function score: {score}")
+        if self.verbose:
+            print(f"Running experiments completed, reward function score: {score}")
         if self.human_in_loop_flag["running experiments"]:
             retry = self.human_in_loop("data preparation", code)
-            if retry: return retry
+            if retry:
+                return retry
         save_to_file("./research_dir/src", "run_experiments.py", code)
         self.set_agent_attr("results_code", code)
         self.set_agent_attr("exp_results", exp_results)
@@ -345,25 +543,39 @@ class LaboratoryWorkflow:
         for _i in range(max_tries):
             if ml_feedback != "":
                 ml_feedback_in = "Feedback provided to the ML agent: " + ml_feedback
-            else: ml_feedback_in = ""
-            resp = self.sw_engineer.inference(self.research_topic, "data preparation", feedback=f"{ml_dialogue}\nFeedback from previous command: {swe_feedback}\n{ml_command}{ml_feedback_in}", step=_i)
+            else:
+                ml_feedback_in = ""
+            resp = self.sw_engineer.inference(
+                self.research_topic,
+                "data preparation",
+                feedback=f"{ml_dialogue}\nFeedback from previous command: {swe_feedback}\n{ml_command}{ml_feedback_in}",
+                step=_i,
+            )
             swe_feedback = str()
             swe_dialogue = str()
             if "```DIALOGUE" in resp:
                 dialogue = extract_prompt(resp, "DIALOGUE")
                 swe_dialogue = f"\nThe following is dialogue produced by the SW Engineer: {dialogue}\n"
-                if self.verbose: print("#"*40, f"\nThe following is dialogue produced by the SW Engineer: {dialogue}", "\n", "#"*40)
+                if self.verbose:
+                    print(
+                        "#" * 40,
+                        f"\nThe following is dialogue produced by the SW Engineer: {dialogue}",
+                        "\n",
+                        "#" * 40,
+                    )
             if "```SUBMIT_CODE" in resp:
                 final_code = extract_prompt(resp, "SUBMIT_CODE")
                 code_resp = execute_code(final_code, timeout=60)
-                if self.verbose: print("!"*100, "\n", f"CODE RESPONSE: {code_resp}")
+                if self.verbose:
+                    print("!" * 100, "\n", f"CODE RESPONSE: {code_resp}")
                 swe_feedback += f"\nCode Response: {code_resp}\n"
                 if "[CODE EXECUTION ERROR]" in code_resp:
                     swe_feedback += "\nERROR: Final code had an error and could not be submitted! You must address and fix this error.\n"
                 else:
                     if self.human_in_loop_flag["data preparation"]:
                         retry = self.human_in_loop("data preparation", final_code)
-                        if retry: return retry
+                        if retry:
+                            return retry
                     save_to_file("./research_dir/src", "load_data.py", final_code)
                     self.set_agent_attr("dataset_code", final_code)
                     # reset agent state
@@ -376,26 +588,38 @@ class LaboratoryWorkflow:
             else:
                 ml_feedback_in = ""
             resp = self.ml_engineer.inference(
-                self.research_topic, "data preparation",
-                feedback=f"{swe_dialogue}\n{ml_feedback_in}", step=_i)
-            #if self.verbose: print("ML Engineer: ", resp, "\n~~~~~~~~~~~")
+                self.research_topic,
+                "data preparation",
+                feedback=f"{swe_dialogue}\n{ml_feedback_in}",
+                step=_i,
+            )
+            # if self.verbose: print("ML Engineer: ", resp, "\n~~~~~~~~~~~")
             ml_feedback = str()
             ml_dialogue = str()
             ml_command = str()
             if "```DIALOGUE" in resp:
                 dialogue = extract_prompt(resp, "DIALOGUE")
                 ml_dialogue = f"\nThe following is dialogue produced by the ML Engineer: {dialogue}\n"
-                if self.verbose: print("#" * 40, f"\nThe following is dialogue produced by the ML Engineer: {dialogue}", "#" * 40, "\n")
+                if self.verbose:
+                    print(
+                        "#" * 40,
+                        f"\nThe following is dialogue produced by the ML Engineer: {dialogue}",
+                        "#" * 40,
+                        "\n",
+                    )
             if "```python" in resp:
                 code = extract_prompt(resp, "python")
                 code = self.ml_engineer.dataset_code + "\n" + code
                 code_resp = execute_code(code, timeout=120)
                 ml_command = f"Code produced by the ML agent:\n{code}"
                 ml_feedback += f"\nCode Response: {code_resp}\n"
-                if self.verbose: print("!"*100, "\n", f"CODE RESPONSE: {code_resp}")
+                if self.verbose:
+                    print("!" * 100, "\n", f"CODE RESPONSE: {code_resp}")
             if "```SEARCH_HF" in resp:
                 hf_query = extract_prompt(resp, "SEARCH_HF")
-                hf_res = "\n".join(hf_engine.results_str(hf_engine.retrieve_ds(hf_query)))
+                hf_res = "\n".join(
+                    hf_engine.results_str(hf_engine.retrieve_ds(hf_query))
+                )
                 ml_command = f"HF search command produced by the ML agent:\n{hf_query}"
                 ml_feedback += f"Huggingface results: {hf_res}\n"
         raise Exception("Max tries during phase: Data Preparation")
@@ -410,34 +634,45 @@ class LaboratoryWorkflow:
         # iterate until max num tries to complete task is exhausted
         for _i in range(max_tries):
             # inference postdoc to
-            resp = self.postdoc.inference(self.research_topic, "plan formulation", feedback=dialogue, step=_i)
-            if self.verbose: print("Postdoc: ", resp, "\n~~~~~~~~~~~")
+            resp = self.postdoc.inference(
+                self.research_topic, "plan formulation", feedback=dialogue, step=_i
+            )
+            if self.verbose:
+                print("Postdoc: ", resp, "\n~~~~~~~~~~~")
             dialogue = str()
 
             if "```DIALOGUE" in resp:
                 dialogue = extract_prompt(resp, "DIALOGUE")
                 dialogue = f"The following is dialogue produced by the postdoctoral researcher: {dialogue}"
-                if self.verbose: print("#"*40, "\n", "Postdoc Dialogue:", dialogue, "\n", "#"*40)
+                if self.verbose:
+                    print("#" * 40, "\n", "Postdoc Dialogue:", dialogue, "\n", "#" * 40)
 
             if "```PLAN" in resp:
                 plan = extract_prompt(resp, "PLAN")
                 if self.human_in_loop_flag["plan formulation"]:
                     retry = self.human_in_loop("plan formulation", plan)
-                    if retry: return retry
+                    if retry:
+                        return retry
                 self.set_agent_attr("plan", plan)
                 # reset agent state
                 self.reset_agents()
                 self.statistics_per_phase["plan formulation"]["steps"] = _i
                 return False
 
-            resp = self.phd.inference(self.research_topic, "plan formulation", feedback=dialogue, step=_i)
-            if self.verbose: print("PhD Student: ", resp, "\n~~~~~~~~~~~")
+            resp = self.phd.inference(
+                self.research_topic, "plan formulation", feedback=dialogue, step=_i
+            )
+            if self.verbose:
+                print("PhD Student: ", resp, "\n~~~~~~~~~~~")
 
             dialogue = str()
             if "```DIALOGUE" in resp:
                 dialogue = extract_prompt(resp, "DIALOGUE")
-                dialogue = f"The following is dialogue produced by the PhD student: {dialogue}"
-                if self.verbose: print("#"*40, "\n", "PhD Dialogue:", dialogue, "#"*40, "\n")
+                dialogue = (
+                    f"The following is dialogue produced by the PhD student: {dialogue}"
+                )
+                if self.verbose:
+                    print("#" * 40, "\n", "PhD Dialogue:", dialogue, "#" * 40, "\n")
         raise Exception("Max tries during phase: Plan Formulation")
 
     def literature_review(self):
@@ -446,12 +681,15 @@ class LaboratoryWorkflow:
         @return: (bool) whether to repeat the phase
         """
         arx_eng = ArxivSearch()
-        max_tries = self.max_steps * 5 # lit review often requires extra steps
+        max_tries = self.max_steps * 5  # lit review often requires extra steps
         # get initial response from PhD agent
-        resp = self.phd.inference(self.research_topic, "literature review", step=0, temp=0.8)
-        if self.verbose: print(resp, "\n~~~~~~~~~~~")
+        resp = self.phd.inference(
+            self.research_topic, "literature review", step=0, temp=0.8
+        )
+        if self.verbose:
+            print(resp, "\n~~~~~~~~~~~")
         # iterate until max num tries to complete task is exhausted
-        for _i in range(max_tries):
+        for i in range(max_tries):
             feedback = str()
 
             # grab summary of papers from arxiv
@@ -464,7 +702,11 @@ class LaboratoryWorkflow:
             elif "```FULL_TEXT" in resp:
                 query = extract_prompt(resp, "FULL_TEXT")
                 # expiration timer so that paper does not remain in context too long
-                arxiv_paper = f"```EXPIRATION {self.arxiv_paper_exp_time}\n" + arx_eng.retrieve_full_paper_text(query) + "```"
+                arxiv_paper = (
+                    f"```EXPIRATION {self.arxiv_paper_exp_time}\n"
+                    + arx_eng.retrieve_full_paper_text(query)
+                    + "```"
+                )
                 feedback = arxiv_paper
 
             # if add paper, extract and add to lit review, provide feedback
@@ -486,15 +728,23 @@ class LaboratoryWorkflow:
                         self.phd.lit_review = []
                         return retry
                 # otherwise, return lit review and move on to next stage
-                if self.verbose: print(self.phd.lit_review_sum)
+                if self.verbose:
+                    print(self.phd.lit_review_sum)
                 # set agent
                 self.set_agent_attr("lit_review_sum", lit_review_sum)
                 # reset agent state
                 self.reset_agents()
-                self.statistics_per_phase["literature review"]["steps"] = _i
+                self.statistics_per_phase["literature review"]["steps"] = i
                 return False
-            resp = self.phd.inference(self.research_topic, "literature review", feedback=feedback, step=_i + 1, temp=0.8)
-            if self.verbose: print(resp, "\n~~~~~~~~~~~")
+            resp = self.phd.inference(
+                self.research_topic,
+                "literature review",
+                feedback=feedback,
+                step=i + 1,
+                temp=0.8,
+            )
+            if self.verbose:
+                print(resp, "\n~~~~~~~~~~~")
         raise Exception("Max tries during phase: Literature Review")
 
     def human_in_loop(self, phase, phase_prod):
@@ -509,228 +759,133 @@ class LaboratoryWorkflow:
         y_or_no = None
         # repeat until a valid answer is provided
         while y_or_no not in ["y", "n"]:
-            y_or_no = input("\n\n\nAre you happy with the presented content? Respond Y or N: ").strip().lower()
+            y_or_no = (
+                input(
+                    "\n\n\nAre you happy with the presented content? Respond Y or N: "
+                )
+                .strip()
+                .lower()
+            )
             # if person is happy with feedback, move on to next stage
-            if y_or_no == "y": pass
+            if y_or_no == "y":
+                pass
             # if not ask for feedback and repeat
             elif y_or_no == "n":
                 # ask the human for feedback
-                notes_for_agent = input("Please provide notes for the agent so that they can try again and improve performance: ")
+                notes_for_agent = input(
+                    "Please provide notes for the agent so that they can try again and improve performance: "
+                )
                 # reset agent state
                 self.reset_agents()
                 # add suggestions to the notes
-                self.notes.append({
-                    "phases": [phase],
-                    "note": notes_for_agent})
+                self.notes.append({"phases": [phase], "note": notes_for_agent})
                 return True
-            else: print("Invalid response, type Y or N")
+            else:
+                print("Invalid response, type Y or N")
         return False
 
 
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+def main(cfg: DictConfig) -> None:
+    setup_logging()
+    api_key = os.getenv("OPENAI_API_KEY") or cfg.api_keys.openai
+    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY") or cfg.api_keys.deepseek
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY") or cfg.api_keys.anthropic
+    fireworks_api_key = os.getenv("FIREWORKS_API_KEY") or cfg.api_keys.fireworks
+    ollama_api_key = cfg.api_keys.ollama
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="AgentLaboratory Research Workflow")
+    if ollama_api_key:
+        os.environ["OLLAMA_API_KEY"] = ollama_api_key
+        api_key = ollama_api_key
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
+    if deepseek_api_key:
+        os.environ["DEEPSEEK_API_KEY"] = deepseek_api_key
+        api_key = deepseek_api_key
+    if anthropic_api_key:
+        os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
+        api_key = anthropic_api_key
+    if fireworks_api_key:
+        os.environ["FIREWORKS_API_KEY"] = fireworks_api_key
+        api_key = fireworks_api_key
+    if cfg.api_keys.ollama:
+        api_key = ollama_api_key
+    if cfg.ollama_host:
+        os.environ["OLLAMA_HOST"] = cfg.ollama_host
+    if cfg.paper_length:
+        os.environ["PAPER_SOLVER_PAPER_LENGTH"] = str(cfg.paper_length)
 
-    parser.add_argument(
-        '--copilot-mode',
-        type=str,
-        default="False",
-        help='Enable human interaction mode.'
-    )
+    if not api_key:
+        raise ValueError(
+            "API key must be provided via config or environment variables."
+        )
 
-    parser.add_argument(
-        '--deepseek-api-key',
-        type=str,
-        help='Provide the DeepSeek API key.'
-    )
-
-    parser.add_argument(
-        '--load-existing',
-        type=str,
-        default="False",
-        help='Do not load existing state; start a new workflow.'
-    )
-
-    parser.add_argument(
-        '--load-existing-path',
-        type=str,
-        help='Path to load existing state; start a new workflow, e.g. state_saves/results_interpretation.pkl'
-    )
-
-    parser.add_argument(
-        '--research-topic',
-        type=str,
-        help='Specify the research topic.'
-    )
-
-    parser.add_argument(
-        '--api-key',
-        type=str,
-        help='Provide the OpenAI API key.'
-    )
-
-    parser.add_argument(
-        '--compile-latex',
-        type=str,
-        default="True",
-        help='Compile latex into pdf during paper writing phase. Disable if you can not install pdflatex.'
-    )
-
-    parser.add_argument(
-        '--llm-backend',
-        type=str,
-        default="o1-mini",
-        help='Backend LLM to use for agents in Agent Laboratory.'
-    )
-
-    parser.add_argument(
-        '--language',
-        type=str,
-        default="English",
-        help='Language to operate Agent Laboratory in.'
-    )
-
-    parser.add_argument(
-        '--num-papers-lit-review',
-        type=str,
-        default="5",
-        help='Total number of papers to summarize in literature review stage'
-    )
-
-    parser.add_argument(
-        '--mlesolver-max-steps',
-        type=str,
-        default="3",
-        help='Total number of mle-solver steps'
-    )
-
-    parser.add_argument(
-        '--papersolver-max-steps',
-        type=str,
-        default="5",
-        help='Total number of paper-solver steps'
-    )
-
-
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_arguments()
-
-    llm_backend = args.llm_backend
-    human_mode = args.copilot_mode.lower() == "true"
-    compile_pdf = args.compile_latex.lower() == "true"
-    load_existing = args.load_existing.lower() == "true"
-    try:
-        num_papers_lit_review = int(args.num_papers_lit_review.lower())
-    except Exception:
-        raise Exception("args.num_papers_lit_review must be a valid integer!")
-    try:
-        papersolver_max_steps = int(args.papersolver_max_steps.lower())
-    except Exception:
-        raise Exception("args.papersolver_max_steps must be a valid integer!")
-    try:
-        mlesolver_max_steps = int(args.mlesolver_max_steps.lower())
-    except Exception:
-        raise Exception("args.papersolver_max_steps must be a valid integer!")
-
-
-    api_key = os.getenv('OPENAI_API_KEY') or args.api_key
-    deepseek_api_key = os.getenv('DEEPSEEK_API_KEY') or args.deepseek_api_key
-    if args.api_key is not None and os.getenv('OPENAI_API_KEY') is None:
-        os.environ["OPENAI_API_KEY"] = args.api_key
-    if args.deepseek_api_key is not None and os.getenv('DEEPSEEK_API_KEY') is None:
-        os.environ["DEEPSEEK_API_KEY"] = args.deepseek_api_key
-
-    if not api_key and not deepseek_api_key:
-        raise ValueError("API key must be provided via --api-key / -deepseek-api-key or the OPENAI_API_KEY / DEEPSEEK_API_KEY environment variable.")
-
-    ##########################################################
-    # Research question that the agents are going to explore #
-    ##########################################################
-    if human_mode or args.research_topic is None:
-        research_topic = input("Please name an experiment idea for AgentLaboratory to perform: ")
+    if cfg.copilot_mode or cfg.research_topic is None:
+        research_topic = input(
+            "Please name an experiment idea for AgentLaboratory to perform: "
+        )
     else:
-        research_topic = args.research_topic
+        research_topic = cfg.research_topic
 
-    task_notes_LLM = [
-        {"phases": ["plan formulation"],
-         "note": f"You should come up with a plan for TWO experiments."},
-
-        {"phases": ["plan formulation", "data preparation", "running experiments"],
-         "note": "Please use gpt-4o-mini for your experiments."},
-
-        {"phases": ["running experiments"],
-         "note": f'Use the following code to inference gpt-4o-mini: \nfrom openai import OpenAI\nos.environ["OPENAI_API_KEY"] = "{api_key}"\nclient = OpenAI()\ncompletion = client.chat.completions.create(\nmodel="gpt-4o-mini-2024-07-18", messages=messages)\nanswer = completion.choices[0].message.content\n'},
-
-        {"phases": ["running experiments"],
-         "note": f"You have access to only gpt-4o-mini using the OpenAI API, please use the following key {api_key} but do not use too many inferences. Do not use openai.ChatCompletion.create or any openai==0.28 commands. Instead use the provided inference code."},
-
-        {"phases": ["running experiments"],
-         "note": "I would recommend using a small dataset (approximately only 100 data points) to run experiments in order to save time. Do not use much more than this unless you have to or are running the final tests."},
-
-        {"phases": ["data preparation", "running experiments"],
-         "note": "You are running on a MacBook laptop. You can use 'mps' with PyTorch"},
-
-        {"phases": ["data preparation", "running experiments"],
-         "note": "Generate figures with very colorful and artistic design."},
-    ]
+    task_notes_LLM = []
+    for task_note in cfg.task_notes:
+        for note in task_note.notes:
+            task_notes_LLM.append(
+                {
+                    "phases": task_note.phases,
+                    "note": note,
+                }
+            )
 
     task_notes_LLM.append(
-        {"phases": ["literature review", "plan formulation", "data preparation", "running experiments", "results interpretation", "report writing", "report refinement"],
-        "note": f"You should always write in the following language to converse and to write the report {args.language}"},
+        {
+            "phases": [
+                "literature review",
+                "plan formulation",
+                "data preparation",
+                "running experiments",
+                "results interpretation",
+                "report writing",
+                "report refinement",
+            ],
+            "note": f"You should always write in the following language to converse and to write the report {cfg.language}",
+        }
     )
 
-    ####################################################
-    ###  Stages where human input will be requested  ###
-    ####################################################
+    human_in_loop: dict[str, str] = cfg.human_in_loop
     human_in_loop = {
-        "literature review":      human_mode,
-        "plan formulation":       human_mode,
-        "data preparation":       human_mode,
-        "running experiments":    human_mode,
-        "results interpretation": human_mode,
-        "report writing":         human_mode,
-        "report refinement":      human_mode,
+        phase.replace("_", " "): cfg.human_in_loop[phase] for phase in human_in_loop
     }
 
-    ###################################################
-    ###  LLM Backend used for the different phases  ###
-    ###################################################
+    agent_models: dict[str, str] = cfg.agent_models
     agent_models = {
-        "literature review":      llm_backend,
-        "plan formulation":       llm_backend,
-        "data preparation":       llm_backend,
-        "running experiments":    llm_backend,
-        "report writing":         llm_backend,
-        "results interpretation": llm_backend,
-        "paper refinement":       llm_backend,
+        phase.replace("_", " "): cfg.agent_models[phase] for phase in agent_models
     }
 
-    if load_existing:
-        load_path = args.load_existing_path
-        if load_path is None:
+    # Initialize or load laboratory
+    if cfg.load_existing:
+        if not cfg.load_existing_path:
             raise ValueError("Please provide path to load existing state.")
-        with open(load_path, "rb") as f:
+        with open(cfg.load_existing_path, "rb") as f:
             lab = pickle.load(f)
     else:
         lab = LaboratoryWorkflow(
             research_topic=research_topic,
             notes=task_notes_LLM,
+            default_llm_backend=cfg.llm_backend,
             agent_model_backbone=agent_models,
             human_in_loop_flag=human_in_loop,
             openai_api_key=api_key,
-            compile_pdf=compile_pdf,
-            num_papers_lit_review=num_papers_lit_review,
-            papersolver_max_steps=papersolver_max_steps,
-            mlesolver_max_steps=mlesolver_max_steps,
+            compile_pdf=cfg.compile_latex,
+            verbose=cfg.verbose,
+            print_costs=cfg.print_costs,
+            num_papers_lit_review=cfg.workflow.num_papers_lit_review,
+            papersolver_max_steps=cfg.workflow.papersolver_max_steps,
+            mlesolver_max_steps=cfg.workflow.mlesolver_max_steps,
         )
 
     lab.perform_research()
 
 
-
-
-
-
+if __name__ == "__main__":
+    main()
