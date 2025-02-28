@@ -10,8 +10,9 @@ research_topic: null
 # General settings
 print_costs: true
 verbose: true
-compile_latex: false
+compile_latex: false # requires pdflatex to be installed
 language: English
+max_steps: 100 # max number of steps for each phase, i.e. compute tolerance budget
 paper_length: 3000 # best effort - actual length may vary based on workflow.papersolver_max_steps
 api_keys:
   openai: null
@@ -21,8 +22,10 @@ api_keys:
   ollama: dummy-not-used
 
 # State loading
-load_existing: false
-load_existing_path: null
+resume:
+  load_existing: false
+  load_existing_path: null
+  update_agent_state: false # update agent max steps, notes, and llm backend
 
 # LLM settings
 # ollama models need to be prefixed with `ollama:`
@@ -64,14 +67,8 @@ task_notes:
     notes:
       - "You should come up with a plan for TWO experiments."
 
-  - phases: [plan formulation, data preparation, running experiments]
-    notes:
-      - "Please use gpt-4o-mini for your experiments."
-
   - phases: [running experiments]
     notes:
-      - "Use the following code to inference gpt-4o-mini: \nfrom openai import OpenAI\nos.environ[\"OPENAI_API_KEY\"] = \"${api_keys.openai}\"\nclient = OpenAI()\ncompletion = client.chat.completions.create(\nmodel=\"gpt-4o-mini-2024-07-18\", messages=messages)\nanswer = completion.choices[0].message.content\n"
-      - "You have access to only gpt-4o-mini using the OpenAI API, please use the following key ${api_keys.openai} but do not use too many inferences. Do not use openai.ChatCompletion.create or any openai==0.28 commands. Instead use the provided inference code."
       - "I would recommend using a small dataset (approximately only 256 data points) to run experiments in order to save time. Do not use much more than this unless you have to or are running the final tests."
 
   - phases: [data preparation, running experiments]

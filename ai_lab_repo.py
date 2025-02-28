@@ -2,7 +2,7 @@ import os
 import pickle
 import sys
 import time
-from copy import copy
+from copy import copy, deepcopy
 
 import hydra
 from omegaconf import DictConfig
@@ -106,7 +106,10 @@ class LaboratoryWorkflow:
                 self.phase_status[subtask] = False
 
         # validate agent_model_backbone contains a llm for each subtask
-        valid_subtasks = [subtask for phase in self.phases for subtask in phase[1]]
+        self.all_subtasks_in_order = [
+            subtask for phase in self.phases for subtask in phase[1]
+        ]
+        valid_subtasks = deepcopy(self.all_subtasks_in_order)
         for phase, llm in agent_model_backbone.items():
             if phase not in valid_subtasks:
                 raise ValueError(f"Invalid phase: {phase}")
@@ -189,6 +192,7 @@ class LaboratoryWorkflow:
         # remove previous files
         remove_figures()
         remove_directory("research_dir")
+        remove_directory("state_saves")
         # make src and research directory
         if not os.path.exists("state_saves"):
             os.mkdir("state_saves")
@@ -200,15 +204,41 @@ class LaboratoryWorkflow:
         self.set_agent_attr("model", model)
         self.reviewers.model = model
 
-    def save_state(self, phase):
+    def save_state(self, subtask):
         """
-        Save state for phase
+        Save state for phase/subtask.
+        If resuming for a previous experiment, then do not save state of previous subtasks.
+        Otherwise it will overwrite the previous states with the resumed experiment state.
         @param phase: (str) phase string
         @return: None
         """
-        phase = phase.replace(" ", "_")
-        with open(f"state_saves/{phase}.pkl", "wb") as f:
+        subtask = subtask.replace(" ", "_")
+        next_phase = self.get_next_subtask(subtask)
+        if (
+            next_phase
+            is not None  # if not the last phase then potentially skip saving state
+            and os.path.exists(
+                f"state_saves/{next_phase}.pkl"
+            )  # don't overwrite previous states when resuming
+            and (
+                self.phase_status[next_phase] is False
+            )  # resumed chkpt might be an earlier phase where we want to overwrite next phases
+        ):
+            return
+        with open(f"state_saves/{subtask}.pkl", "wb") as f:
             pickle.dump(self, f)
+
+    def get_next_subtask(self, phase_subtask):
+        """
+        Get next phase
+        @param phase: (str) phase string
+        @return: (str) next phase string
+        """
+        curr_subtask_id = self.all_subtasks_in_order.index(phase_subtask)
+        next_subtask_id = curr_subtask_id + 1
+        if next_subtask_id >= len(self.all_subtasks_in_order):
+            return None  # last phase
+        return self.all_subtasks_in_order[next_subtask_id]
 
     def set_agent_attr(self, attr, obj):
         """
@@ -246,11 +276,10 @@ class LaboratoryWorkflow:
             for subtask in subtasks:
                 if self.verbose:
                     print(f"{'&' * 30}\nBeginning subtask: {subtask}\n{'&' * 30}")
-                if type(self.phase_models) is dict:
-                    if subtask in self.phase_models:
-                        self.set_model(self.phase_models[subtask])
-                    else:
-                        self.set_model(DEFAULT_LLM_BACKEND)
+                if subtask in self.phase_models:
+                    self.set_model(self.phase_models[subtask])
+                else:
+                    self.set_model(self.default_llm_backend)
                 if (
                     subtask not in self.phase_status or not self.phase_status[subtask]
                 ) and subtask == "literature review":
@@ -794,9 +823,6 @@ def main(cfg: DictConfig) -> None:
     fireworks_api_key = os.getenv("FIREWORKS_API_KEY") or cfg.api_keys.fireworks
     ollama_api_key = cfg.api_keys.ollama
 
-    if ollama_api_key:
-        os.environ["OLLAMA_API_KEY"] = ollama_api_key
-        api_key = ollama_api_key
     if api_key:
         os.environ["OPENAI_API_KEY"] = api_key
     if deepseek_api_key:
@@ -808,7 +834,7 @@ def main(cfg: DictConfig) -> None:
     if fireworks_api_key:
         os.environ["FIREWORKS_API_KEY"] = fireworks_api_key
         api_key = fireworks_api_key
-    if cfg.api_keys.ollama:
+    if ollama_api_key:
         api_key = ollama_api_key
     if cfg.ollama_host:
         os.environ["OLLAMA_HOST"] = cfg.ollama_host
@@ -863,11 +889,17 @@ def main(cfg: DictConfig) -> None:
     }
 
     # Initialize or load laboratory
-    if cfg.load_existing:
-        if not cfg.load_existing_path:
+    if cfg.resume.load_existing:
+        if not cfg.resume.load_existing_path:
             raise ValueError("Please provide path to load existing state.")
-        with open(cfg.load_existing_path, "rb") as f:
-            lab = pickle.load(f)
+        with open(cfg.resume.load_existing_path, "rb") as f:
+            lab: LaboratoryWorkflow = pickle.load(f)
+            # if the user wants to change the agent state in subsequent runs
+            if cfg.resume.update_agent_state:
+                lab.phase_models = agent_models
+                lab.default_llm_backend = cfg.llm_backend
+                lab.set_agent_attr("notes", task_notes_LLM)
+                lab.set_agent_attr("max_steps", cfg.max_steps)
     else:
         lab = LaboratoryWorkflow(
             research_topic=research_topic,
@@ -879,6 +911,7 @@ def main(cfg: DictConfig) -> None:
             compile_pdf=cfg.compile_latex,
             verbose=cfg.verbose,
             print_costs=cfg.print_costs,
+            max_steps=cfg.max_steps,
             num_papers_lit_review=cfg.workflow.num_papers_lit_review,
             papersolver_max_steps=cfg.workflow.papersolver_max_steps,
             mlesolver_max_steps=cfg.workflow.mlesolver_max_steps,
